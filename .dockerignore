@@ -1,0 +1,13 @@
+.git
+.github
+.gitignore
+.dockerignore
+.idea
+.vscode
+README.md
+Makefile
+tests
+*.md
+coverage*
+bin/
+dist/

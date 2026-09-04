@@ -1,0 +1,15 @@
+/bin/
+/dist/
+*.exe
+*.out
+coverage
+coverage.*
+*.db
+uploads/
+minio-data/
+postgres-data/
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
