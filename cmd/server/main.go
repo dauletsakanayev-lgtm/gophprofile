@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 )
@@ -18,6 +19,7 @@ const (
 	defaultS3AccessKey = "minioadmin"
 	defaultS3SecretKey = "minioadmin"
 	defaultS3Bucket    = "avatars"
+	defaultAMQP        = "amqp://guest:guest@localhost:5673/"
 	defaultHTTPAddr    = ":8080"
 )
 
@@ -54,8 +56,18 @@ func main() {
 	}
 	log.Println("S3 bucket ready:", defaultS3Bucket)
 
+	log.Println("connecting to RabbitMQ...")
+	amqpConn, amqpCh, err := broker.Connect(envOr("AMQP_URL", defaultAMQP))
+	if err != nil {
+		log.Fatalf("amqp connect: %v", err)
+	}
+	defer amqpConn.Close()
+	defer amqpCh.Close()
+	log.Println("RabbitMQ queue ready:", broker.QueueName)
+
+	pub := broker.NewPublisher(amqpCh)
 	repo := storage.NewPostgresAvatarRepo(db)
-	ah := httpsrv.NewAvatarHandler(repo, s3)
+	ah := httpsrv.NewAvatarHandler(repo, s3, pub)
 	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah)
 
 	if err := srv.Run(ctx); err != nil {

@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/model"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/go-chi/chi/v5"
@@ -27,10 +29,11 @@ var allowedMIME = map[string]struct{}{
 type AvatarHandler struct {
 	repo storage.AvatarRepository
 	s3   *storage.S3Store
+	pub  *broker.Publisher
 }
 
-func NewAvatarHandler(repo storage.AvatarRepository, s3 *storage.S3Store) *AvatarHandler {
-	return &AvatarHandler{repo: repo, s3: s3}
+func NewAvatarHandler(repo storage.AvatarRepository, s3 *storage.S3Store, pub *broker.Publisher) *AvatarHandler {
+	return &AvatarHandler{repo: repo, s3: s3, pub: pub}
 }
 
 // Create — POST /api/v1/avatars.
@@ -72,6 +75,15 @@ func (h *AvatarHandler) Create(w http.ResponseWriter, r *http.Request) {
 		_ = h.s3.Delete(r.Context(), key)
 		http.Error(w, "db insert failed", http.StatusInternalServerError)
 		return
+	}
+
+	if err := h.pub.Publish(r.Context(), broker.AvatarTask{
+		AvatarID:    created.ID.String(),
+		OriginalKey: created.OriginalKey,
+	}); err != nil {
+		// Не откатываем БД/S3 — задачу можно ретригернуть вручную,
+		// а status в БД остаётся pending — видно, что необработано.
+		log.Printf("publish avatar task %s: %v", created.ID, err)
 	}
 
 	writeJSON(w, http.StatusCreated, created)
