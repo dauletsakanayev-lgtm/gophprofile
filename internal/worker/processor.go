@@ -22,10 +22,10 @@ const (
 // Processor реализует broker.Handler.
 type Processor struct {
 	repo storage.AvatarRepository
-	s3   *storage.S3Store
+	s3   storage.ObjectStore // было *storage.S3Store
 }
 
-func NewProcessor(repo storage.AvatarRepository, s3 *storage.S3Store) *Processor {
+func NewProcessor(repo storage.AvatarRepository, s3 storage.ObjectStore) *Processor {
 	return &Processor{repo: repo, s3: s3}
 }
 

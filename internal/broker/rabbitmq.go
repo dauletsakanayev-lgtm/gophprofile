@@ -9,6 +9,11 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+// TaskPublisher — контракт публикации задач (для мокирования в тестах).
+type TaskPublisher interface {
+	Publish(ctx context.Context, task AvatarTask) error
+}
+
 // QueueName — имя очереди для задач обработки аватаров.
 const QueueName = "avatars.new"
 

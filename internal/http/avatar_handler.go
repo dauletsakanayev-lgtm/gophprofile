@@ -28,11 +28,11 @@ var allowedMIME = map[string]struct{}{
 // AvatarHandler — REST-хендлер для операций с аватарами.
 type AvatarHandler struct {
 	repo storage.AvatarRepository
-	s3   *storage.S3Store
-	pub  *broker.Publisher
+	s3   storage.ObjectStore  // было *storage.S3Store
+	pub  broker.TaskPublisher // было *broker.Publisher
 }
 
-func NewAvatarHandler(repo storage.AvatarRepository, s3 *storage.S3Store, pub *broker.Publisher) *AvatarHandler {
+func NewAvatarHandler(repo storage.AvatarRepository, s3 storage.ObjectStore, pub broker.TaskPublisher) *AvatarHandler {
 	return &AvatarHandler{repo: repo, s3: s3, pub: pub}
 }
 

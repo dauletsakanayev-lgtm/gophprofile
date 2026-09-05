@@ -10,6 +10,14 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// ObjectStore — контракт объектного хранилища.
+// Позволяет подменять реализацию (например, in-memory в тестах).
+type ObjectStore interface {
+	Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	Delete(ctx context.Context, key string) error
+}
+
 // S3Config — параметры подключения к S3/MinIO.
 type S3Config struct {
 	Endpoint  string // "localhost:9000"
