@@ -1,13 +1,14 @@
 // Command gophprofile-server поднимает HTTP-сервер GophProfile.
-// Пока умеет применить миграции и инициализировать S3 —
-// HTTP появится в подшаге D.
 package main
 
 import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
+	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 )
 
@@ -17,6 +18,7 @@ const (
 	defaultS3AccessKey = "minioadmin"
 	defaultS3SecretKey = "minioadmin"
 	defaultS3Bucket    = "avatars"
+	defaultHTTPAddr    = ":8080"
 )
 
 func main() {
@@ -35,8 +37,11 @@ func main() {
 	}
 	log.Println("migrations applied successfully")
 
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stop()
+
 	log.Println("connecting to S3/MinIO...")
-	ctx := context.Background()
 	s3, err := storage.NewS3Store(ctx, storage.S3Config{
 		Endpoint:  envOr("S3_ENDPOINT", defaultS3Endpoint),
 		AccessKey: envOr("S3_ACCESS_KEY", defaultS3AccessKey),
@@ -49,7 +54,13 @@ func main() {
 	}
 	log.Println("S3 bucket ready:", defaultS3Bucket)
 
-	_ = s3 // будет использован HTTP-обработчиками в подшаге D
+	repo := storage.NewPostgresAvatarRepo(db)
+	ah := httpsrv.NewAvatarHandler(repo, s3)
+	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah)
+
+	if err := srv.Run(ctx); err != nil {
+		log.Fatalf("http server: %v", err)
+	}
 }
 
 func envOr(key, def string) string {

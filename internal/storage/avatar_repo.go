@@ -36,16 +36,18 @@ func scanAvatar(a *model.Avatar, sc interface{ Scan(...any) error }) error {
 		&a.CreatedAt, &a.UpdatedAt)
 }
 
+// Create сохраняет новый аватар. ID генерируется приложением (uuid.New())
+// до вызова, потому что S3-ключ формируется по id ещё до записи в БД.
 func (r *PostgresAvatarRepo) Create(ctx context.Context, a *model.Avatar) (*model.Avatar, error) {
 	const q = `
-		INSERT INTO avatars (user_id, original_key, content_type, size_bytes)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO avatars (id, user_id, original_key, content_type, size_bytes)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, user_id, status, original_key, processed_key,
 		          content_type, size_bytes, error, created_at, updated_at
 	`
 	out := &model.Avatar{}
 	if err := scanAvatar(out, r.db.QueryRowContext(ctx, q,
-		a.UserID, a.OriginalKey, a.ContentType, a.SizeBytes)); err != nil {
+		a.ID, a.UserID, a.OriginalKey, a.ContentType, a.SizeBytes)); err != nil {
 		return nil, fmt.Errorf("insert avatar: %w", err)
 	}
 	return out, nil
