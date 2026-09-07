@@ -122,7 +122,8 @@ func TestAvatarRepo_SetProcessing_OK(t *testing.T) {
 	repo, mock := newMockRepo(t)
 	id := uuid.New()
 	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'processing'`).
-		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+		WithArgs(id, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	require.NoError(t, repo.SetProcessing(context.Background(), id))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -131,7 +132,8 @@ func TestAvatarRepo_SetProcessing_NoRows(t *testing.T) {
 	repo, mock := newMockRepo(t)
 	id := uuid.New()
 	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'processing'`).
-		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 0))
+		WithArgs(id, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	err := repo.SetProcessing(context.Background(), id)
 	require.ErrorIs(t, err, ErrAvatarNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())

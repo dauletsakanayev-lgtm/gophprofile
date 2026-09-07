@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/model"
 	"github.com/google/uuid"
 )
+
+// StaleProcessingTTL — сколько ждать перед повторной обработкой зависшей задачи
+// (worker упал между SetProcessing и SetCompleted). После истечения TTL
+// redelivery снова захватывает лизу.
+const StaleProcessingTTL = 5 * time.Minute
 
 // ErrAvatarNotFound — аватар не найден или soft-deleted или чужой.
 var ErrAvatarNotFound = errors.New("avatar not found")
@@ -133,14 +139,21 @@ func (r *PostgresAvatarRepo) SetProcessing(ctx context.Context, id uuid.UUID) er
 	const q = `
 		UPDATE avatars
 		SET processing_status = 'processing', updated_at = NOW()
-		WHERE id = $1 AND processing_status = 'pending' AND deleted_at IS NULL`
-	res, err := r.db.ExecContext(ctx, q, id)
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		  AND (
+		    processing_status = 'pending'
+		    OR (processing_status = 'processing' AND updated_at < NOW() - $2::interval)
+		  )`
+	res, err := r.db.ExecContext(ctx, q, id, StaleProcessingTTL.String())
 	if err != nil {
 		return fmt.Errorf("set processing: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return ErrAvatarNotFound // либо уже processing/completed — идемпотентно skip
+		// либо completed/failed — терминальный статус,
+		// либо processing со свежим updated_at — другой воркер обрабатывает
+		return ErrAvatarNotFound
 	}
 	return nil
 }

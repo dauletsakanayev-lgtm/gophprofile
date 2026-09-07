@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"time"
@@ -193,7 +194,8 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 		writeJSONErr(w, http.StatusBadRequest, "Invalid size",
 			"allowed: original, 100x100, 300x300")
 	default:
-		writeJSONErr(w, http.StatusInternalServerError, "internal error", err.Error())
+		log.Printf("internal error: %v", err)
+		writeJSONErr(w, http.StatusInternalServerError, "Internal server error", "")
 	}
 }
 
