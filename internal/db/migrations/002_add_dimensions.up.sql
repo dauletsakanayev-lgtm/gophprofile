@@ -1,0 +1,2 @@
+ALTER TABLE avatars ADD COLUMN width_px  INTEGER;
+ALTER TABLE avatars ADD COLUMN height_px INTEGER;

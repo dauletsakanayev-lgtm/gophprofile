@@ -18,7 +18,7 @@ type Server struct {
 }
 
 // New собирает роутер и возвращает готовый сервер.
-func New(addr string, ah *AvatarHandler) *Server {
+func New(addr string, ah *AvatarHandler, hh *HealthHandler) *Server {
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
@@ -26,24 +26,41 @@ func New(addr string, ah *AvatarHandler) *Server {
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.Timeout(30 * time.Second))
 
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	// /health и /healthz — оба возвращают глубокий статус.
+	r.Method(http.MethodGet, "/health", hh)
+	r.Method(http.MethodGet, "/healthz", hh)
 
-	r.Head("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	// Статика фронтенда (одностраничка от Yandex Practicum).
+	r.Handle("/", http.RedirectHandler("/web/", http.StatusFound))
+
+	r.Get("/web/upload", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/static/index.html")
 	})
+	// ТЗ: галерея аватаров пользователя.
+	r.Get("/web/gallery/{user_id}", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/static/index.html")
+	})
+	// POST /web/upload — форма может слать напрямую сюда,
+	// user_id читается из multipart-поля user_id (без X-User-ID header).
+	r.Post("/web/upload", ah.WebUpload)
+
+	// Fallback — статика (index.html, будущие JS/CSS).
+	r.Handle("/web/*", http.StripPrefix("/web/",
+		http.FileServer(http.Dir("web/static"))))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(AuthMiddleware)
-		r.Route("/avatars", func(r chi.Router) {
-			r.Post("/", ah.Create)
-			r.Get("/", ah.List)
-			r.Get("/{id}", ah.Get)
-			r.Get("/{id}/original", ah.DownloadOriginal)
-			r.Get("/{id}/processed", ah.DownloadProcessed)
-			r.Delete("/{id}", ah.Delete)
+		// Публичные (без X-User-ID): чтение.
+		r.Get("/avatars/{id}", ah.Get)
+		r.Get("/avatars/{id}/metadata", ah.GetMetadata)
+		r.Get("/users/{user_id}/avatar", ah.GetUserAvatar)
+		r.Get("/users/{user_id}/avatars", ah.ListUserAvatars)
+
+		// Защищённые (с X-User-ID): запись.
+		r.Group(func(r chi.Router) {
+			r.Use(AuthMiddleware)
+			r.Post("/avatars", ah.Create)
+			r.Delete("/avatars/{id}", ah.Delete)
+			r.Delete("/users/{user_id}/avatar", ah.DeleteUserAvatar)
 		})
 	})
 

@@ -55,11 +55,25 @@ func main() {
 	defer conn.Close()
 	defer ch.Close()
 
+	// Отдельный канал для delete-consumer'а: QoS нельзя менять дважды на одном канале.
+	delCh, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("open delete channel: %v", err)
+	}
+	defer delCh.Close()
+
 	repo := storage.NewPostgresAvatarRepo(db)
 	proc := worker.NewProcessor(repo, s3)
+	delProc := worker.NewDeleteProcessor(s3)
 
-	log.Println("gophprofile-worker: consuming", broker.QueueName)
-	if err := broker.Consume(ctx, ch, proc.Handle); err != nil && !errors.Is(err, context.Canceled) {
+	log.Println("gophprofile-worker: consuming", broker.QueueName, "and", broker.DeleteQueueName)
+
+	// Two consumers in parallel on separate channels.
+	errCh := make(chan error, 2)
+	go func() { errCh <- broker.Consume(ctx, ch, proc.Handle) }()
+	go func() { errCh <- broker.ConsumeDelete(ctx, delCh, delProc.Handle) }()
+
+	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("consume: %v", err)
 	}
 	log.Println("gophprofile-worker: shutdown")

@@ -96,3 +96,9 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	}
 	return nil
 }
+
+// HealthCheck проверяет доступность S3-бакета.
+func (s *S3Store) HealthCheck(ctx context.Context) error {
+	_, err := s.client.BucketExists(ctx, s.bucket)
+	return err
+}

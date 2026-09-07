@@ -10,14 +10,16 @@ import (
 )
 
 func TestServer_New_ReturnsNonNil(t *testing.T) {
-	ah := NewAvatarHandler(newFakeRepo(), newFakeS3(), &fakePub{})
-	s := New(":0", ah)
+	ah := NewAvatarHandler(newFakeSvc())
+	hh := NewHealthHandler(nil, nil, nil)
+	s := New(":0", ah, hh)
 	require.NotNil(t, s)
 }
 
 func TestServer_Run_ShutdownOnCtxCancel(t *testing.T) {
-	ah := NewAvatarHandler(newFakeRepo(), newFakeS3(), &fakePub{})
-	s := New("127.0.0.1:0", ah)
+	ah := NewAvatarHandler(newFakeSvc())
+	hh := NewHealthHandler(nil, nil, nil)
+	s := New("127.0.0.1:0", ah, hh)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

@@ -12,6 +12,7 @@ import (
 // TaskPublisher — контракт публикации задач (для мокирования в тестах).
 type TaskPublisher interface {
 	Publish(ctx context.Context, task AvatarTask) error
+	PublishDelete(ctx context.Context, task DeleteTask) error
 }
 
 // QueueName — имя очереди для задач обработки аватаров.
@@ -21,6 +22,15 @@ const QueueName = "avatars.new"
 type AvatarTask struct {
 	AvatarID    string `json:"avatar_id"`
 	OriginalKey string `json:"original_key"`
+}
+
+// DeleteQueueName — очередь задач на удаление файлов из S3.
+const DeleteQueueName = "avatars.delete"
+
+// DeleteTask — payload задачи удаления: список S3-ключей к очистке.
+type DeleteTask struct {
+	AvatarID string   `json:"avatar_id"`
+	S3Keys   []string `json:"s3_keys"`
 }
 
 // Connect подключается к RabbitMQ по URL и объявляет durable очередь.
@@ -39,6 +49,11 @@ func Connect(url string) (*amqp.Connection, *amqp.Channel, error) {
 		_ = ch.Close()
 		_ = conn.Close()
 		return nil, nil, fmt.Errorf("declare queue %s: %w", QueueName, err)
+	}
+	if _, err := ch.QueueDeclare(DeleteQueueName, true, false, false, false, nil); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("declare queue %s: %w", DeleteQueueName, err)
 	}
 	return conn, ch, nil
 }
@@ -62,6 +77,24 @@ func (p *Publisher) Publish(ctx context.Context, task AvatarTask) error {
 	return p.ch.PublishWithContext(ctx,
 		"",        // default exchange
 		QueueName, // routing key
+		false, false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+		},
+	)
+}
+
+// PublishDelete отправляет задачу удаления файлов из S3 в очередь avatars.delete.
+func (p *Publisher) PublishDelete(ctx context.Context, task DeleteTask) error {
+	body, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("marshal delete task: %w", err)
+	}
+	return p.ch.PublishWithContext(ctx,
+		"",
+		DeleteQueueName,
 		false, false,
 		amqp.Publishing{
 			ContentType:  "application/json",

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -10,16 +11,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// ErrAvatarNotFound — аватар не найден или принадлежит другому пользователю.
+// ErrAvatarNotFound — аватар не найден или soft-deleted или чужой.
 var ErrAvatarNotFound = errors.New("avatar not found")
 
 // AvatarRepository — контракт хранилища метаданных аватаров.
 type AvatarRepository interface {
 	Create(ctx context.Context, a *model.Avatar) (*model.Avatar, error)
-	Get(ctx context.Context, userID int64, id uuid.UUID) (*model.Avatar, error)
-	ListByUser(ctx context.Context, userID int64) ([]*model.Avatar, error)
-	UpdateStatus(ctx context.Context, id uuid.UUID, status model.AvatarStatus, processedKey, errMsg *string) error
-	Delete(ctx context.Context, userID int64, id uuid.UUID) error
+	Get(ctx context.Context, id uuid.UUID) (*model.Avatar, error)
+	GetByUser(ctx context.Context, userID string) (*model.Avatar, error) // последний active
+	ListByUser(ctx context.Context, userID string) ([]*model.Avatar, error)
+	SetProcessing(ctx context.Context, id uuid.UUID) error
+	SetCompleted(ctx context.Context, id uuid.UUID, thumbnails map[string]string, width, height int) error
+	SetFailed(ctx context.Context, id uuid.UUID, errMsg string) error
+	SoftDelete(ctx context.Context, id uuid.UUID) error
 }
 
 type PostgresAvatarRepo struct {
@@ -30,37 +34,50 @@ func NewPostgresAvatarRepo(db *sql.DB) *PostgresAvatarRepo {
 	return &PostgresAvatarRepo{db: db}
 }
 
-func scanAvatar(a *model.Avatar, sc interface{ Scan(...any) error }) error {
-	return sc.Scan(&a.ID, &a.UserID, &a.Status, &a.OriginalKey,
-		&a.ProcessedKey, &a.ContentType, &a.SizeBytes, &a.Error,
-		&a.CreatedAt, &a.UpdatedAt)
+// scanAvatar заполняет *model.Avatar из sql-строки.
+type scanner interface{ Scan(dest ...any) error }
+
+func scanAvatar(a *model.Avatar, sc scanner) error {
+	var thumbsRaw []byte
+	if err := sc.Scan(&a.ID, &a.UserID, &a.FileName, &a.MimeType, &a.SizeBytes,
+		&a.S3Key, &thumbsRaw, &a.UploadStatus, &a.ProcessingStatus,
+		&a.Width, &a.Height,
+		&a.CreatedAt, &a.UpdatedAt, &a.DeletedAt); err != nil {
+		return err
+	}
+	if len(thumbsRaw) > 0 {
+		if err := json.Unmarshal(thumbsRaw, &a.ThumbnailKeys); err != nil {
+			return fmt.Errorf("unmarshal thumbnails: %w", err)
+		}
+	}
+	return nil
 }
 
-// Create сохраняет новый аватар. ID генерируется приложением (uuid.New())
-// до вызова, потому что S3-ключ формируется по id ещё до записи в БД.
+const avatarCols = `id, user_id, file_name, mime_type, size_bytes, s3_key,
+                   thumbnail_s3_keys, upload_status, processing_status,
+                   width_px, height_px,
+                   created_at, updated_at, deleted_at`
+
+// Create вставляет запись со статусом uploaded/pending (файл уже в S3).
 func (r *PostgresAvatarRepo) Create(ctx context.Context, a *model.Avatar) (*model.Avatar, error) {
 	const q = `
-		INSERT INTO avatars (id, user_id, original_key, content_type, size_bytes)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, user_id, status, original_key, processed_key,
-		          content_type, size_bytes, error, created_at, updated_at
-	`
+		INSERT INTO avatars (id, user_id, file_name, mime_type, size_bytes,
+		                    s3_key, upload_status, processing_status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'uploaded', 'pending')
+		RETURNING ` + avatarCols
 	out := &model.Avatar{}
 	if err := scanAvatar(out, r.db.QueryRowContext(ctx, q,
-		a.ID, a.UserID, a.OriginalKey, a.ContentType, a.SizeBytes)); err != nil {
+		a.ID, a.UserID, a.FileName, a.MimeType, a.SizeBytes, a.S3Key)); err != nil {
 		return nil, fmt.Errorf("insert avatar: %w", err)
 	}
 	return out, nil
 }
 
-func (r *PostgresAvatarRepo) Get(ctx context.Context, userID int64, id uuid.UUID) (*model.Avatar, error) {
-	const q = `
-		SELECT id, user_id, status, original_key, processed_key,
-		       content_type, size_bytes, error, created_at, updated_at
-		FROM avatars WHERE id = $1 AND user_id = $2
-	`
+// Get возвращает аватар по id (только active — не soft-deleted).
+func (r *PostgresAvatarRepo) Get(ctx context.Context, id uuid.UUID) (*model.Avatar, error) {
+	const q = `SELECT ` + avatarCols + ` FROM avatars WHERE id = $1 AND deleted_at IS NULL`
 	a := &model.Avatar{}
-	err := scanAvatar(a, r.db.QueryRowContext(ctx, q, id, userID))
+	err := scanAvatar(a, r.db.QueryRowContext(ctx, q, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrAvatarNotFound
 	}
@@ -70,13 +87,29 @@ func (r *PostgresAvatarRepo) Get(ctx context.Context, userID int64, id uuid.UUID
 	return a, nil
 }
 
-func (r *PostgresAvatarRepo) ListByUser(ctx context.Context, userID int64) ([]*model.Avatar, error) {
-	const q = `
-		SELECT id, user_id, status, original_key, processed_key,
-		       content_type, size_bytes, error, created_at, updated_at
-		FROM avatars WHERE user_id = $1
-		ORDER BY created_at DESC
-	`
+// GetByUser возвращает последний active-аватар пользователя.
+func (r *PostgresAvatarRepo) GetByUser(ctx context.Context, userID string) (*model.Avatar, error) {
+	const q = `SELECT ` + avatarCols + `
+	           FROM avatars
+	           WHERE user_id = $1 AND deleted_at IS NULL
+	           ORDER BY created_at DESC LIMIT 1`
+	a := &model.Avatar{}
+	err := scanAvatar(a, r.db.QueryRowContext(ctx, q, userID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrAvatarNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select avatar by user: %w", err)
+	}
+	return a, nil
+}
+
+// ListByUser возвращает все active-аватары пользователя.
+func (r *PostgresAvatarRepo) ListByUser(ctx context.Context, userID string) ([]*model.Avatar, error) {
+	const q = `SELECT ` + avatarCols + `
+	           FROM avatars
+	           WHERE user_id = $1 AND deleted_at IS NULL
+	           ORDER BY created_at DESC`
 	rows, err := r.db.QueryContext(ctx, q, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query avatars: %w", err)
@@ -94,20 +127,42 @@ func (r *PostgresAvatarRepo) ListByUser(ctx context.Context, userID int64) ([]*m
 	return out, rows.Err()
 }
 
-// UpdateStatus вызывается воркером после (успешной или неуспешной) обработки.
-// processedKey и errMsg — опциональные (передавай nil где не нужно).
-func (r *PostgresAvatarRepo) UpdateStatus(ctx context.Context,
-	id uuid.UUID, status model.AvatarStatus,
-	processedKey, errMsg *string) error {
-
+// SetProcessing переводит processing_status в 'processing' (для идемпотентности —
+// только если сейчас 'pending').
+func (r *PostgresAvatarRepo) SetProcessing(ctx context.Context, id uuid.UUID) error {
 	const q = `
 		UPDATE avatars
-		SET status = $1, processed_key = $2, error = $3, updated_at = NOW()
-		WHERE id = $4
-	`
-	res, err := r.db.ExecContext(ctx, q, status, processedKey, errMsg, id)
+		SET processing_status = 'processing', updated_at = NOW()
+		WHERE id = $1 AND processing_status = 'pending' AND deleted_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q, id)
 	if err != nil {
-		return fmt.Errorf("update status: %w", err)
+		return fmt.Errorf("set processing: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAvatarNotFound // либо уже processing/completed — идемпотентно skip
+	}
+	return nil
+}
+
+// SetCompleted проставляет 'completed' и сохраняет карту миниатюр.
+func (r *PostgresAvatarRepo) SetCompleted(ctx context.Context, id uuid.UUID,
+	thumbnails map[string]string, width, height int) error {
+	body, err := json.Marshal(thumbnails)
+	if err != nil {
+		return fmt.Errorf("marshal thumbnails: %w", err)
+	}
+	const q = `
+		UPDATE avatars
+		SET processing_status = 'completed',
+		    thumbnail_s3_keys = $1::jsonb,
+		    width_px  = $2,
+		    height_px = $3,
+		    updated_at = NOW()
+		WHERE id = $4 AND deleted_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q, body, width, height, id)
+	if err != nil {
+		return fmt.Errorf("set completed: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
@@ -116,11 +171,33 @@ func (r *PostgresAvatarRepo) UpdateStatus(ctx context.Context,
 	return nil
 }
 
-func (r *PostgresAvatarRepo) Delete(ctx context.Context, userID int64, id uuid.UUID) error {
-	const q = `DELETE FROM avatars WHERE id = $1 AND user_id = $2`
-	res, err := r.db.ExecContext(ctx, q, id, userID)
+// SetFailed проставляет 'failed' (текст ошибки логируется, в БД не храним).
+func (r *PostgresAvatarRepo) SetFailed(ctx context.Context, id uuid.UUID, _ string) error {
+	const q = `
+		UPDATE avatars
+		SET processing_status = 'failed', updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q, id)
 	if err != nil {
-		return fmt.Errorf("delete avatar: %w", err)
+		return fmt.Errorf("set failed: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAvatarNotFound
+	}
+	return nil
+}
+
+// SoftDelete проставляет deleted_at (мягкое удаление).
+// Реальное удаление файлов из S3 делает воркер по событию.
+func (r *PostgresAvatarRepo) SoftDelete(ctx context.Context, id uuid.UUID) error {
+	const q = `
+		UPDATE avatars
+		SET deleted_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q, id)
+	if err != nil {
+		return fmt.Errorf("soft delete: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {

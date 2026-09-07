@@ -3,6 +3,7 @@ package http
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,17 +14,16 @@ func TestAuthMiddleware(t *testing.T) {
 		name       string
 		header     string
 		wantStatus int
-		wantUserID int64
+		wantUserID string
 	}{
-		{"no header", "", http.StatusUnauthorized, 0},
-		{"non-numeric", "abc", http.StatusUnauthorized, 0},
-		{"zero", "0", http.StatusUnauthorized, 0},
-		{"negative", "-5", http.StatusUnauthorized, 0},
-		{"valid", "42", http.StatusOK, 42},
+		{"no header", "", http.StatusUnauthorized, ""},
+		{"too long", strings.Repeat("a", 256), http.StatusUnauthorized, ""},
+		{"valid string", "alice@example.com", http.StatusOK, "alice@example.com"},
+		{"single char", "x", http.StatusOK, "x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var seen int64
+			var seen string
 			h := AuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				seen = userIDFromCtx(r.Context())
 				w.WriteHeader(http.StatusOK)

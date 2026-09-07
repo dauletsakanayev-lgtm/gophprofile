@@ -18,38 +18,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ---------- fakes ----------
-
 type fakeRepo struct {
-	mu       sync.Mutex
-	statuses []model.AvatarStatus
-	items    map[uuid.UUID]*model.Avatar
+	mu         sync.Mutex
+	items      map[uuid.UUID]*model.Avatar
+	processing []uuid.UUID
+	completed  []uuid.UUID
+	failed     []uuid.UUID
+	setProcErr error
 }
 
 func newFakeRepo() *fakeRepo { return &fakeRepo{items: map[uuid.UUID]*model.Avatar{}} }
 
-func (f *fakeRepo) Create(_ context.Context, a *model.Avatar) (*model.Avatar, error) { return a, nil }
-func (f *fakeRepo) Get(_ context.Context, _ int64, id uuid.UUID) (*model.Avatar, error) {
+func (f *fakeRepo) Create(context.Context, *model.Avatar) (*model.Avatar, error) { return nil, nil }
+func (f *fakeRepo) Get(_ context.Context, id uuid.UUID) (*model.Avatar, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	a, ok := f.items[id]
-	if !ok {
-		return nil, storage.ErrAvatarNotFound
-	}
-	return a, nil
-}
-func (f *fakeRepo) ListByUser(context.Context, int64) ([]*model.Avatar, error) { return nil, nil }
-func (f *fakeRepo) Delete(context.Context, int64, uuid.UUID) error             { return nil }
-func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID,
-	status model.AvatarStatus, processedKey, errMsg *string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.statuses = append(f.statuses, status)
 	if a, ok := f.items[id]; ok {
-		a.Status = status
-		a.ProcessedKey = processedKey
-		a.Error = errMsg
+		return a, nil
 	}
+	return nil, storage.ErrAvatarNotFound
+}
+func (f *fakeRepo) GetByUser(context.Context, string) (*model.Avatar, error)    { return nil, nil }
+func (f *fakeRepo) ListByUser(context.Context, string) ([]*model.Avatar, error) { return nil, nil }
+func (f *fakeRepo) SoftDelete(context.Context, uuid.UUID) error                 { return nil }
+
+func (f *fakeRepo) SetProcessing(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.setProcErr != nil {
+		return f.setProcErr
+	}
+	f.processing = append(f.processing, id)
+	return nil
+}
+
+func (f *fakeRepo) SetCompleted(_ context.Context, id uuid.UUID, thumbnails map[string]string, _, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completed = append(f.completed, id)
+	if a, ok := f.items[id]; ok {
+		a.ThumbnailKeys = thumbnails
+	}
+	return nil
+}
+
+func (f *fakeRepo) SetFailed(_ context.Context, id uuid.UUID, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed = append(f.failed, id)
 	return nil
 }
 
@@ -94,13 +110,12 @@ func (s *fakeS3) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-// tinyJPEG возвращает валидный 4x4 JPEG (декодируется imaging.Decode).
 func tinyJPEG(t *testing.T) []byte {
 	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
-	for x := 0; x < 4; x++ {
-		for y := 0; y < 4; y++ {
-			img.Set(x, y, color.RGBA{R: uint8(x * 60), G: uint8(y * 60), B: 100, A: 255})
+	img := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	for x := 0; x < 400; x++ {
+		for y := 0; y < 400; y++ {
+			img.Set(x, y, color.RGBA{R: uint8(x % 256), G: uint8(y % 256), B: 100, A: 255})
 		}
 	}
 	var buf bytes.Buffer
@@ -108,58 +123,70 @@ func tinyJPEG(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
-// ---------- tests ----------
-
-func TestProcessor_Handle_Ready(t *testing.T) {
-	repo := newFakeRepo()
-	s3 := newFakeS3()
+func TestProcessor_Completed_TwoThumbnails(t *testing.T) {
+	repo, s3 := newFakeRepo(), newFakeS3()
 	id := uuid.New()
-	repo.items[id] = &model.Avatar{ID: id, UserID: 1, Status: model.AvatarPending, OriginalKey: "original/x"}
+	repo.items[id] = &model.Avatar{ID: id, UserID: "u", S3Key: "original/x"}
 	s3.objects["original/x"] = tinyJPEG(t)
 
 	p := NewProcessor(repo, s3)
-	err := p.Handle(context.Background(), broker.AvatarTask{
+	require.NoError(t, p.Handle(context.Background(), broker.AvatarTask{
 		AvatarID: id.String(), OriginalKey: "original/x",
-	})
-	require.NoError(t, err)
+	}))
 
-	require.Equal(t, []model.AvatarStatus{model.AvatarProcessing, model.AvatarReady}, repo.statuses)
-	require.Contains(t, s3.objects, "processed/"+id.String())
+	require.Equal(t, []uuid.UUID{id}, repo.processing)
+	require.Equal(t, []uuid.UUID{id}, repo.completed)
+	require.Empty(t, repo.failed)
+
+	key100 := "thumbnails/" + id.String() + "/100x100.jpg"
+	key300 := "thumbnails/" + id.String() + "/300x300.jpg"
+	require.Contains(t, s3.objects, key100)
+	require.Contains(t, s3.objects, key300)
 }
 
-func TestProcessor_Handle_S3GetFails_MarkFailed(t *testing.T) {
-	repo := newFakeRepo()
-	s3 := newFakeS3()
-	s3.getErr = errors.New("s3 down")
+func TestProcessor_IdempotentSkip(t *testing.T) {
+	repo, s3 := newFakeRepo(), newFakeS3()
+	repo.setProcErr = storage.ErrAvatarNotFound
 	id := uuid.New()
-	repo.items[id] = &model.Avatar{ID: id, UserID: 1, Status: model.AvatarPending}
 
 	p := NewProcessor(repo, s3)
-	err := p.Handle(context.Background(), broker.AvatarTask{
+	require.NoError(t, p.Handle(context.Background(), broker.AvatarTask{
 		AvatarID: id.String(), OriginalKey: "original/x",
-	})
-	require.Error(t, err)
-	require.Equal(t, []model.AvatarStatus{model.AvatarProcessing, model.AvatarFailed}, repo.statuses)
-	require.NotNil(t, repo.items[id].Error)
+	}))
+	require.Empty(t, repo.processing)
+	require.Empty(t, repo.completed)
+	require.Empty(t, repo.failed)
 }
 
-func TestProcessor_Handle_DecodeFails_MarkFailed(t *testing.T) {
-	repo := newFakeRepo()
-	s3 := newFakeS3()
+func TestProcessor_S3GetFails_MarkFailed(t *testing.T) {
+	repo, s3 := newFakeRepo(), newFakeS3()
+	s3.getErr = errors.New("s3 down")
 	id := uuid.New()
-	repo.items[id] = &model.Avatar{ID: id, UserID: 1, Status: model.AvatarPending}
+	repo.items[id] = &model.Avatar{ID: id, UserID: "u"}
+
+	p := NewProcessor(repo, s3)
+	require.Error(t, p.Handle(context.Background(), broker.AvatarTask{
+		AvatarID: id.String(), OriginalKey: "original/x",
+	}))
+	require.Equal(t, []uuid.UUID{id}, repo.processing)
+	require.Equal(t, []uuid.UUID{id}, repo.failed)
+	require.Empty(t, repo.completed)
+}
+
+func TestProcessor_DecodeFails_MarkFailed(t *testing.T) {
+	repo, s3 := newFakeRepo(), newFakeS3()
+	id := uuid.New()
+	repo.items[id] = &model.Avatar{ID: id, UserID: "u"}
 	s3.objects["original/x"] = []byte("not-an-image")
 
 	p := NewProcessor(repo, s3)
-	err := p.Handle(context.Background(), broker.AvatarTask{
+	require.Error(t, p.Handle(context.Background(), broker.AvatarTask{
 		AvatarID: id.String(), OriginalKey: "original/x",
-	})
-	require.Error(t, err)
-	require.Equal(t, []model.AvatarStatus{model.AvatarProcessing, model.AvatarFailed}, repo.statuses)
+	}))
+	require.Equal(t, []uuid.UUID{id}, repo.failed)
 }
 
-func TestProcessor_Handle_BadUUID(t *testing.T) {
+func TestProcessor_BadUUID(t *testing.T) {
 	p := NewProcessor(newFakeRepo(), newFakeS3())
-	err := p.Handle(context.Background(), broker.AvatarTask{AvatarID: "not-uuid"})
-	require.Error(t, err)
+	require.Error(t, p.Handle(context.Background(), broker.AvatarTask{AvatarID: "bad"}))
 }

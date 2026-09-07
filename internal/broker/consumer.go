@@ -52,3 +52,36 @@ func processOne(ctx context.Context, msg amqp.Delivery, handler Handler) {
 	}
 	_ = msg.Ack(false)
 }
+
+// DeleteHandler — обработчик задачи удаления.
+type DeleteHandler func(ctx context.Context, task DeleteTask) error
+
+// ConsumeDelete подписывается на очередь avatars.delete.
+func ConsumeDelete(ctx context.Context, ch *amqp.Channel, handler DeleteHandler) error {
+	msgs, err := ch.Consume(DeleteQueueName, "", false, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("consume delete: %w", err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg, ok := <-msgs:
+			if !ok {
+				return errors.New("delete consumer channel closed")
+			}
+			var task DeleteTask
+			if err := json.Unmarshal(msg.Body, &task); err != nil {
+				log.Printf("broker: bad delete message: %v", err)
+				_ = msg.Nack(false, false)
+				continue
+			}
+			if err := handler(ctx, task); err != nil {
+				log.Printf("broker: delete handler failed for %s: %v", task.AvatarID, err)
+				_ = msg.Nack(false, false)
+				continue
+			}
+			_ = msg.Ack(false)
+		}
+	}
+}

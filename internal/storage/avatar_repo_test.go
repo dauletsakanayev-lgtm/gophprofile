@@ -20,40 +20,43 @@ func newMockRepo(t *testing.T) (*PostgresAvatarRepo, sqlmock.Sqlmock) {
 	return NewPostgresAvatarRepo(db), mock
 }
 
+var avatarColumns = []string{
+	"id", "user_id", "file_name", "mime_type", "size_bytes", "s3_key",
+	"thumbnail_s3_keys", "upload_status", "processing_status",
+	"width_px", "height_px",
+	"created_at", "updated_at", "deleted_at",
+}
+
 func TestAvatarRepo_Create_OK(t *testing.T) {
 	repo, mock := newMockRepo(t)
 	id := uuid.New()
 	now := time.Now()
 
-	rows := sqlmock.NewRows([]string{
-		"id", "user_id", "status", "original_key", "processed_key",
-		"content_type", "size_bytes", "error", "created_at", "updated_at",
-	}).AddRow(id, int64(1), "pending", "original/x", nil,
-		"image/jpeg", int64(100), nil, now, now)
+	rows := sqlmock.NewRows(avatarColumns).AddRow(
+		id, "alice", "p.jpg", "image/jpeg", int64(100), "original/x",
+		nil, "uploaded", "pending", nil, nil, now, now, nil)
 
 	mock.ExpectQuery(`INSERT INTO avatars`).
-		WithArgs(id, int64(1), "original/x", "image/jpeg", int64(100)).
+		WithArgs(id, "alice", "p.jpg", "image/jpeg", int64(100), "original/x").
 		WillReturnRows(rows)
 
 	got, err := repo.Create(context.Background(), &model.Avatar{
-		ID: id, UserID: 1, OriginalKey: "original/x",
-		ContentType: "image/jpeg", SizeBytes: 100,
+		ID: id, UserID: "alice", FileName: "p.jpg",
+		MimeType: "image/jpeg", SizeBytes: 100, S3Key: "original/x",
 	})
 	require.NoError(t, err)
-	require.Equal(t, model.AvatarPending, got.Status)
-	require.Equal(t, int64(100), got.SizeBytes)
+	require.Equal(t, model.UploadUploaded, got.UploadStatus)
+	require.Equal(t, model.ProcessingPending, got.ProcessingStatus)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestAvatarRepo_Get_NotFound(t *testing.T) {
 	repo, mock := newMockRepo(t)
 	id := uuid.New()
+	mock.ExpectQuery(`SELECT .* FROM avatars WHERE id`).
+		WithArgs(id).WillReturnError(sql.ErrNoRows)
 
-	mock.ExpectQuery(`SELECT .* FROM avatars WHERE`).
-		WithArgs(id, int64(1)).
-		WillReturnError(sql.ErrNoRows)
-
-	_, err := repo.Get(context.Background(), 1, id)
+	_, err := repo.Get(context.Background(), id)
 	require.ErrorIs(t, err, ErrAvatarNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -63,73 +66,35 @@ func TestAvatarRepo_Get_OK(t *testing.T) {
 	id := uuid.New()
 	now := time.Now()
 
-	rows := sqlmock.NewRows([]string{
-		"id", "user_id", "status", "original_key", "processed_key",
-		"content_type", "size_bytes", "error", "created_at", "updated_at",
-	}).AddRow(id, int64(1), "ready", "original/x", "processed/x",
-		"image/jpeg", int64(200), nil, now, now)
+	rows := sqlmock.NewRows(avatarColumns).AddRow(
+		id, "alice", "p.jpg", "image/jpeg", int64(200), "original/x",
+		[]byte(`{"100x100":"th/100.jpg"}`), "uploaded", "completed", nil, nil, now, now, nil)
 
-	mock.ExpectQuery(`SELECT .* FROM avatars WHERE`).
-		WithArgs(id, int64(1)).
-		WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT .* FROM avatars WHERE id`).
+		WithArgs(id).WillReturnRows(rows)
 
-	a, err := repo.Get(context.Background(), 1, id)
+	a, err := repo.Get(context.Background(), id)
 	require.NoError(t, err)
-	require.Equal(t, model.AvatarReady, a.Status)
-	require.NotNil(t, a.ProcessedKey)
-	require.Equal(t, "processed/x", *a.ProcessedKey)
+	require.Equal(t, model.ProcessingCompleted, a.ProcessingStatus)
+	require.Equal(t, "th/100.jpg", a.ThumbnailKeys["100x100"])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestAvatarRepo_UpdateStatus_OK(t *testing.T) {
+func TestAvatarRepo_GetByUser_OK(t *testing.T) {
 	repo, mock := newMockRepo(t)
 	id := uuid.New()
-	pk := "processed/x"
+	now := time.Now()
 
-	mock.ExpectExec(`UPDATE avatars`).
-		WithArgs(model.AvatarReady, &pk, (*string)(nil), id).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	rows := sqlmock.NewRows(avatarColumns).AddRow(
+		id, "bob", "b.jpg", "image/png", int64(300), "original/b",
+		nil, "uploaded", "completed", nil, nil, now, now, nil)
 
-	err := repo.UpdateStatus(context.Background(), id, model.AvatarReady, &pk, nil)
+	mock.ExpectQuery(`FROM avatars\s+WHERE user_id`).
+		WithArgs("bob").WillReturnRows(rows)
+
+	a, err := repo.GetByUser(context.Background(), "bob")
 	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestAvatarRepo_UpdateStatus_NotFound(t *testing.T) {
-	repo, mock := newMockRepo(t)
-	id := uuid.New()
-
-	mock.ExpectExec(`UPDATE avatars`).
-		WithArgs(model.AvatarFailed, (*string)(nil), (*string)(nil), id).
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
-	err := repo.UpdateStatus(context.Background(), id, model.AvatarFailed, nil, nil)
-	require.ErrorIs(t, err, ErrAvatarNotFound)
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestAvatarRepo_Delete_OK(t *testing.T) {
-	repo, mock := newMockRepo(t)
-	id := uuid.New()
-
-	mock.ExpectExec(`DELETE FROM avatars`).
-		WithArgs(id, int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	require.NoError(t, repo.Delete(context.Background(), 1, id))
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
-func TestAvatarRepo_Delete_NotFound(t *testing.T) {
-	repo, mock := newMockRepo(t)
-	id := uuid.New()
-
-	mock.ExpectExec(`DELETE FROM avatars`).
-		WithArgs(id, int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
-	err := repo.Delete(context.Background(), 1, id)
-	require.ErrorIs(t, err, ErrAvatarNotFound)
+	require.Equal(t, "bob", a.UserID)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -138,40 +103,75 @@ func TestAvatarRepo_ListByUser(t *testing.T) {
 	id1, id2 := uuid.New(), uuid.New()
 	now := time.Now()
 
-	rows := sqlmock.NewRows([]string{
-		"id", "user_id", "status", "original_key", "processed_key",
-		"content_type", "size_bytes", "error", "created_at", "updated_at",
-	}).
-		AddRow(id1, int64(1), "ready", "original/a", "processed/a",
-			"image/jpeg", int64(100), nil, now, now).
-		AddRow(id2, int64(1), "pending", "original/b", nil,
-			"image/png", int64(200), nil, now, now)
+	rows := sqlmock.NewRows(avatarColumns).
+		AddRow(id1, "alice", "a1.jpg", "image/jpeg", int64(100), "k1",
+			nil, "uploaded", "completed", nil, nil, now, now, nil).
+		AddRow(id2, "alice", "a2.jpg", "image/png", int64(200), "k2",
+			nil, "uploaded", "pending", nil, nil, now, now, nil)
 
-	mock.ExpectQuery(`SELECT .* FROM avatars WHERE user_id`).
-		WithArgs(int64(1)).
-		WillReturnRows(rows)
+	mock.ExpectQuery(`FROM avatars\s+WHERE user_id`).
+		WithArgs("alice").WillReturnRows(rows)
 
-	out, err := repo.ListByUser(context.Background(), 1)
+	out, err := repo.ListByUser(context.Background(), "alice")
 	require.NoError(t, err)
 	require.Len(t, out, 2)
-	require.Equal(t, model.AvatarReady, out[0].Status)
-	require.Equal(t, model.AvatarPending, out[1].Status)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestAvatarRepo_ListByUser_Empty(t *testing.T) {
+func TestAvatarRepo_SetProcessing_OK(t *testing.T) {
 	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'processing'`).
+		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, repo.SetProcessing(context.Background(), id))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
 
-	rows := sqlmock.NewRows([]string{
-		"id", "user_id", "status", "original_key", "processed_key",
-		"content_type", "size_bytes", "error", "created_at", "updated_at",
-	})
-	mock.ExpectQuery(`SELECT .* FROM avatars WHERE user_id`).
-		WithArgs(int64(42)).
-		WillReturnRows(rows)
+func TestAvatarRepo_SetProcessing_NoRows(t *testing.T) {
+	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'processing'`).
+		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 0))
+	err := repo.SetProcessing(context.Background(), id)
+	require.ErrorIs(t, err, ErrAvatarNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
 
-	out, err := repo.ListByUser(context.Background(), 42)
-	require.NoError(t, err)
-	require.Empty(t, out)
+func TestAvatarRepo_SetCompleted_OK(t *testing.T) {
+	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'completed'`).
+		WithArgs(sqlmock.AnyArg(), 200, 100, id).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, repo.SetCompleted(context.Background(), id,
+		map[string]string{"100x100": "th/100.jpg"}, 200, 100))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestAvatarRepo_SetFailed_OK(t *testing.T) {
+	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET processing_status = 'failed'`).
+		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, repo.SetFailed(context.Background(), id, "boom"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestAvatarRepo_SoftDelete_OK(t *testing.T) {
+	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET deleted_at`).
+		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+	require.NoError(t, repo.SoftDelete(context.Background(), id))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestAvatarRepo_SoftDelete_NotFound(t *testing.T) {
+	repo, mock := newMockRepo(t)
+	id := uuid.New()
+	mock.ExpectExec(`UPDATE avatars\s+SET deleted_at`).
+		WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 0))
+	err := repo.SoftDelete(context.Background(), id)
+	require.ErrorIs(t, err, ErrAvatarNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

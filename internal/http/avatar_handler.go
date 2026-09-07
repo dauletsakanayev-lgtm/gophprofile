@@ -4,212 +4,300 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"mime/multipart"
 	"net/http"
+	"time"
 
-	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/model"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/service"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
-const (
-	maxUploadBytes = 5 << 20 // 5 MB
-	fieldName      = "file"
-)
+// fieldNames — оба имени поля multipart: "image" (SPA от Practicum), "file" (по ТЗ).
+var fieldNames = []string{"image", "file"}
 
-var allowedMIME = map[string]struct{}{
-	"image/jpeg": {},
-	"image/png":  {},
-	"image/webp": {},
-}
-
-// AvatarHandler — REST-хендлер для операций с аватарами.
+// AvatarHandler — HTTP-транспорт. Всю бизнес-логику делегирует service.
 type AvatarHandler struct {
-	repo storage.AvatarRepository
-	s3   storage.ObjectStore  // было *storage.S3Store
-	pub  broker.TaskPublisher // было *broker.Publisher
+	svc service.AvatarService
 }
 
-func NewAvatarHandler(repo storage.AvatarRepository, s3 storage.ObjectStore, pub broker.TaskPublisher) *AvatarHandler {
-	return &AvatarHandler{repo: repo, s3: s3, pub: pub}
+func NewAvatarHandler(svc service.AvatarService) *AvatarHandler {
+	return &AvatarHandler{svc: svc}
 }
 
 // Create — POST /api/v1/avatars.
-// multipart-форма с полем "file", загружает оригинал в S3 и создаёт запись в БД.
 func (h *AvatarHandler) Create(w http.ResponseWriter, r *http.Request) {
 	userID := userIDFromCtx(r.Context())
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxUploadBytes)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	file, header, err := r.FormFile(fieldName)
+	var (
+		file   multipart.File
+		header *multipart.FileHeader
+		err    error
+	)
+	for _, name := range fieldNames {
+		file, header, err = r.FormFile(name)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
-		http.Error(w, "expected form field 'file': "+err.Error(), http.StatusBadRequest)
+		writeJSONErr(w, http.StatusBadRequest,
+			"Expected form field 'image' or 'file'", err.Error())
 		return
 	}
 	defer file.Close()
 
-	ct := header.Header.Get("Content-Type")
-	if _, ok := allowedMIME[ct]; !ok {
-		http.Error(w, "unsupported content type: "+ct, http.StatusUnsupportedMediaType)
-		return
-	}
-
-	id := uuid.New()
-	key := "original/" + id.String()
-
-	if err := h.s3.Put(r.Context(), key, file, header.Size, ct); err != nil {
-		http.Error(w, "s3 put failed", http.StatusInternalServerError)
-		return
-	}
-
-	created, err := h.repo.Create(r.Context(), &model.Avatar{
-		ID:          id,
-		UserID:      userID,
-		OriginalKey: key,
-		ContentType: ct,
-		SizeBytes:   header.Size,
+	created, err := h.svc.Upload(r.Context(), service.UploadCmd{
+		UserID:    userID,
+		FileName:  header.Filename,
+		MimeType:  header.Header.Get("Content-Type"),
+		SizeBytes: header.Size,
+		Reader:    file,
 	})
 	if err != nil {
-		// Компенсация: удаляем осиротевший объект из S3
-		_ = h.s3.Delete(r.Context(), key)
-		http.Error(w, "db insert failed", http.StatusInternalServerError)
+		writeServiceErr(w, err)
 		return
 	}
 
-	if err := h.pub.Publish(r.Context(), broker.AvatarTask{
-		AvatarID:    created.ID.String(),
-		OriginalKey: created.OriginalKey,
-	}); err != nil {
-		// Не откатываем БД/S3 — задачу можно ретригернуть вручную,
-		// а status в БД остаётся pending — видно, что необработано.
-		log.Printf("publish avatar task %s: %v", created.ID, err)
-	}
-
-	writeJSON(w, http.StatusCreated, created)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         created.ID,
+		"user_id":    created.UserID,
+		"url":        "/api/v1/avatars/" + created.ID.String(),
+		"status":     "processing",
+		"created_at": created.CreatedAt.UTC().Format(time.RFC3339),
+	})
 }
 
-// List — GET /api/v1/avatars.
-func (h *AvatarHandler) List(w http.ResponseWriter, r *http.Request) {
-	items, err := h.repo.ListByUser(r.Context(), userIDFromCtx(r.Context()))
-	if err != nil {
-		http.Error(w, "db query failed", http.StatusInternalServerError)
-		return
-	}
-	if items == nil {
-		items = []*model.Avatar{}
-	}
-	writeJSON(w, http.StatusOK, items)
-}
-
-// Get — GET /api/v1/avatars/{id}.
+// Get — GET /api/v1/avatars/{id}?size=original|100x100|300x300.
 func (h *AvatarHandler) Get(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid id", http.StatusBadRequest)
+		writeJSONErr(w, http.StatusBadRequest, "Invalid id", err.Error())
 		return
 	}
-	a, err := h.repo.Get(r.Context(), userIDFromCtx(r.Context()), id)
-	if errors.Is(err, storage.ErrAvatarNotFound) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
+	a, err := h.svc.Get(r.Context(), id)
 	if err != nil {
-		http.Error(w, "db query failed", http.StatusInternalServerError)
+		writeServiceErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, a)
+	h.stream(w, r, a)
 }
 
-// DownloadOriginal — GET /api/v1/avatars/{id}/original.
-func (h *AvatarHandler) DownloadOriginal(w http.ResponseWriter, r *http.Request) {
-	h.download(w, r, "original")
-}
-
-// DownloadProcessed — GET /api/v1/avatars/{id}/processed.
-func (h *AvatarHandler) DownloadProcessed(w http.ResponseWriter, r *http.Request) {
-	h.download(w, r, "processed")
-}
-
-func (h *AvatarHandler) download(w http.ResponseWriter, r *http.Request, which string) {
+// GetMetadata — GET /api/v1/avatars/{id}/metadata.
+func (h *AvatarHandler) GetMetadata(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid id", http.StatusBadRequest)
+		writeJSONErr(w, http.StatusBadRequest, "Invalid id", err.Error())
 		return
 	}
-	a, err := h.repo.Get(r.Context(), userIDFromCtx(r.Context()), id)
-	if errors.Is(err, storage.ErrAvatarNotFound) {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
+	a, err := h.svc.Get(r.Context(), id)
 	if err != nil {
-		http.Error(w, "db query failed", http.StatusInternalServerError)
+		writeServiceErr(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, metadataResponse(a))
+}
 
-	var key string
-	switch which {
-	case "original":
-		key = a.OriginalKey
-	case "processed":
-		if a.ProcessedKey == nil {
-			http.Error(w, "processed version not ready", http.StatusNotFound)
-			return
-		}
-		key = *a.ProcessedKey
-	}
-
-	obj, err := h.s3.Get(r.Context(), key)
-	if errors.Is(err, storage.ErrObjectNotFound) {
-		http.Error(w, "object missing in storage", http.StatusNotFound)
-		return
-	}
+// GetUserAvatar — GET /api/v1/users/{user_id}/avatar (бинарь последнего active).
+func (h *AvatarHandler) GetUserAvatar(w http.ResponseWriter, r *http.Request) {
+	a, err := h.svc.GetByUser(r.Context(), chi.URLParam(r, "user_id"))
 	if err != nil {
-		http.Error(w, "s3 get failed", http.StatusInternalServerError)
+		writeServiceErr(w, err)
 		return
 	}
-	defer obj.Close()
+	h.stream(w, r, a)
+}
 
-	w.Header().Set("Content-Type", a.ContentType)
-	_, _ = io.Copy(w, obj)
+// ListUserAvatars — GET /api/v1/users/{user_id}/avatars.
+func (h *AvatarHandler) ListUserAvatars(w http.ResponseWriter, r *http.Request) {
+	items, err := h.svc.ListByUser(r.Context(), chi.URLParam(r, "user_id"))
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	out := make([]any, 0, len(items))
+	for _, a := range items {
+		out = append(out, metadataResponse(a))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // Delete — DELETE /api/v1/avatars/{id}.
 func (h *AvatarHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	userID := userIDFromCtx(r.Context())
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
-		http.Error(w, "invalid id", http.StatusBadRequest)
+		writeJSONErr(w, http.StatusBadRequest, "Invalid id", err.Error())
 		return
 	}
-
-	// Сначала получаем ключи, чтобы потом почистить S3.
-	a, err := h.repo.Get(r.Context(), userID, id)
-	if errors.Is(err, storage.ErrAvatarNotFound) {
-		http.Error(w, "not found", http.StatusNotFound)
+	if err := h.svc.Delete(r.Context(), id, userIDFromCtx(r.Context())); err != nil {
+		writeServiceErr(w, err)
 		return
 	}
-	if err != nil {
-		http.Error(w, "db query failed", http.StatusInternalServerError)
-		return
-	}
-
-	if err := h.repo.Delete(r.Context(), userID, id); err != nil {
-		http.Error(w, "db delete failed", http.StatusInternalServerError)
-		return
-	}
-
-	// Best-effort: если упадёт — объекты в S3 осиротеют (потом почистим отдельным job'ом).
-	_ = h.s3.Delete(r.Context(), a.OriginalKey)
-	if a.ProcessedKey != nil {
-		_ = h.s3.Delete(r.Context(), *a.ProcessedKey)
-	}
-
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteUserAvatar — DELETE /api/v1/users/{user_id}/avatar.
+func (h *AvatarHandler) DeleteUserAvatar(w http.ResponseWriter, r *http.Request) {
+	err := h.svc.DeleteByUser(r.Context(),
+		chi.URLParam(r, "user_id"), userIDFromCtx(r.Context()))
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// stream отдаёт бинарь картинки по запрошенному size (query-параметр).
+func (h *AvatarHandler) stream(w http.ResponseWriter, r *http.Request, a *model.Avatar) {
+	obj, ct, err := h.svc.OpenFile(r.Context(), a, r.URL.Query().Get("size"))
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+	defer obj.Close()
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "max-age=86400")
+	_, _ = io.Copy(w, obj)
+}
+
+// writeServiceErr переводит бизнес-ошибки в HTTP-статусы.
+func writeServiceErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, storage.ErrAvatarNotFound):
+		writeJSONErr(w, http.StatusNotFound, "Avatar not found", "")
+	case errors.Is(err, storage.ErrObjectNotFound):
+		writeJSONErr(w, http.StatusNotFound, "Object missing in storage", "")
+	case errors.Is(err, service.ErrForbidden):
+		writeJSONMap(w, http.StatusForbidden, map[string]any{
+			"error":   "Forbidden",
+			"details": "You can only delete your own avatars",
+		})
+	case errors.Is(err, service.ErrUnsupportedMIME):
+		writeJSONMap(w, http.StatusBadRequest, map[string]any{
+			"error":   "Invalid file format",
+			"details": "Supported formats: jpeg, png, webp",
+		})
+	case errors.Is(err, service.ErrFileTooLarge):
+		writeJSONMap(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error":    "File too large",
+			"max_size": service.MaxUploadBytes,
+		})
+	case errors.Is(err, service.ErrThumbnailNotReady):
+		writeJSONErr(w, http.StatusNotFound, "Thumbnail not ready", "processing in progress")
+	case errors.Is(err, service.ErrThumbnailNotFound):
+		writeJSONErr(w, http.StatusNotFound, "Thumbnail not found", "")
+	case errors.Is(err, service.ErrInvalidSize):
+		writeJSONErr(w, http.StatusBadRequest, "Invalid size",
+			"allowed: original, 100x100, 300x300")
+	default:
+		writeJSONErr(w, http.StatusInternalServerError, "internal error", err.Error())
+	}
+}
+
+// metadataResponse формирует JSON-метаданные по формату ТЗ.
+func metadataResponse(a *model.Avatar) map[string]any {
+	thumbs := make([]map[string]string, 0, len(a.ThumbnailKeys))
+	for size, key := range a.ThumbnailKeys {
+		thumbs = append(thumbs, map[string]string{
+			"size": size,
+			"url":  "/api/v1/avatars/" + a.ID.String() + "?size=" + size,
+			"key":  key,
+		})
+	}
+	resp := map[string]any{
+		"id":                a.ID,
+		"user_id":           a.UserID,
+		"file_name":         a.FileName,
+		"mime_type":         a.MimeType,
+		"size":              a.SizeBytes,
+		"upload_status":     a.UploadStatus,
+		"processing_status": a.ProcessingStatus,
+		"thumbnails":        thumbs,
+		"created_at":        a.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":        a.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if a.Width != nil && a.Height != nil {
+		resp["dimensions"] = map[string]int{"width": *a.Width, "height": *a.Height}
+	}
+	return resp
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONMap(w http.ResponseWriter, status int, m map[string]any) {
+	writeJSON(w, status, m)
+}
+
+func writeJSONErr(w http.ResponseWriter, status int, msg, details string) {
+	m := map[string]any{"error": msg}
+	if details != "" {
+		m["details"] = details
+	}
+	writeJSON(w, status, m)
+}
+
+// WebUpload — POST /web/upload. Форма шлёт multipart с user_id + file/image.
+// Аналог Create, но user_id читается не из header, а из поля формы.
+func (h *AvatarHandler) WebUpload(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxUploadBytes)
+
+	// Извлекаем user_id из формы (поддерживаем оба варианта имени).
+	if err := r.ParseMultipartForm(service.MaxUploadBytes); err != nil {
+		writeJSONErr(w, http.StatusBadRequest, "Invalid form", err.Error())
+		return
+	}
+	userID := r.FormValue("user_id")
+	if userID == "" {
+		userID = r.FormValue("userId")
+	}
+	if userID == "" || len(userID) > 255 {
+		writeJSONErr(w, http.StatusBadRequest,
+			"user_id form field required (1-255 chars)", "")
+		return
+	}
+
+	var (
+		file   multipart.File
+		header *multipart.FileHeader
+		err    error
+	)
+	for _, name := range fieldNames {
+		file, header, err = r.FormFile(name)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		writeJSONErr(w, http.StatusBadRequest,
+			"Expected form field 'image' or 'file'", err.Error())
+		return
+	}
+	defer file.Close()
+
+	created, err := h.svc.Upload(r.Context(), service.UploadCmd{
+		UserID:    userID,
+		FileName:  header.Filename,
+		MimeType:  header.Header.Get("Content-Type"),
+		SizeBytes: header.Size,
+		Reader:    file,
+	})
+	if err != nil {
+		writeServiceErr(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         created.ID,
+		"user_id":    created.UserID,
+		"url":        "/api/v1/avatars/" + created.ID.String(),
+		"status":     "processing",
+		"created_at": created.CreatedAt.UTC().Format(time.RFC3339),
+	})
 }

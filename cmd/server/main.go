@@ -10,6 +10,7 @@ import (
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/service"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 )
 
@@ -67,8 +68,10 @@ func main() {
 
 	pub := broker.NewPublisher(amqpCh)
 	repo := storage.NewPostgresAvatarRepo(db)
-	ah := httpsrv.NewAvatarHandler(repo, s3, pub)
-	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah)
+	svc := service.New(repo, s3, pub)
+	ah := httpsrv.NewAvatarHandler(svc)
+	hh := httpsrv.NewHealthHandler(db, s3, amqpCh)
+	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh)
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("http server: %v", err)
