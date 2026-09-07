@@ -33,20 +33,19 @@ func New(addr string, ah *AvatarHandler, hh *HealthHandler) *Server {
 	// Статика фронтенда (одностраничка от Yandex Practicum).
 	r.Handle("/", http.RedirectHandler("/web/", http.StatusFound))
 
-	r.Get("/web/upload", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "web/static/index.html")
+	// Статика + SPA-роуты по ТЗ.
+	r.Route("/web", func(r chi.Router) {
+		serveIndex := func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFile(w, r, "web/static/index.html")
+		}
+		r.Get("/", serveIndex)
+		r.Get("/upload", serveIndex)
+		r.Get("/gallery/{user_id}", serveIndex)
+		r.Post("/upload", ah.WebUpload)
+		// Fallback — статика (JS/CSS/картинки).
+		r.Handle("/*", http.StripPrefix("/web/",
+			http.FileServer(http.Dir("web/static"))))
 	})
-	// ТЗ: галерея аватаров пользователя.
-	r.Get("/web/gallery/{user_id}", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "web/static/index.html")
-	})
-	// POST /web/upload — форма может слать напрямую сюда,
-	// user_id читается из multipart-поля user_id (без X-User-ID header).
-	r.Post("/web/upload", ah.WebUpload)
-
-	// Fallback — статика (index.html, будущие JS/CSS).
-	r.Handle("/web/*", http.StripPrefix("/web/",
-		http.FileServer(http.Dir("web/static"))))
 
 	r.Route("/api/v1", func(r chi.Router) {
 		// Публичные (без X-User-ID): чтение.
