@@ -7,12 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/model"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Бизнес-ошибки. Транспорт мапит их в HTTP-статусы.
@@ -67,13 +73,30 @@ func New(repo storage.AvatarRepository, s3 storage.ObjectStore, pub broker.TaskP
 	return &Service{repo: repo, s3: s3, pub: pub}
 }
 
+var svcTracer = otel.Tracer("gophprofile/service")
+
 // Upload валидирует MIME/размер, кладёт в S3 → сохраняет в БД → публикует в брокер.
 // При ошибке БД компенсирует загрузку в S3 (удаляет осиротевший объект).
 func (s *Service) Upload(ctx context.Context, cmd UploadCmd) (*model.Avatar, error) {
+	ctx, span := svcTracer.Start(ctx, "avatar.upload",
+		trace.WithAttributes(
+			attribute.String("user_id", cmd.UserID),
+			attribute.String("file_name", cmd.FileName),
+			attribute.String("mime_type", cmd.MimeType),
+			attribute.Int64("size_bytes", cmd.SizeBytes),
+		))
+	defer span.End()
+
+	start := time.Now()
+	defer func() { metrics.AvatarsUploadDuration.Observe(time.Since(start).Seconds()) }()
+
 	if _, ok := allowedMIME[cmd.MimeType]; !ok {
+		metrics.AvatarsUploadsTotal.WithLabelValues("bad_mime").Inc()
+		span.SetStatus(codes.Error, "unsupported mime")
 		return nil, ErrUnsupportedMIME
 	}
 	if cmd.SizeBytes > MaxUploadBytes {
+		metrics.AvatarsUploadsTotal.WithLabelValues("too_large").Inc()
 		return nil, ErrFileTooLarge
 	}
 
@@ -81,6 +104,7 @@ func (s *Service) Upload(ctx context.Context, cmd UploadCmd) (*model.Avatar, err
 	key := "original/" + id.String()
 
 	if err := s.s3.Put(ctx, key, cmd.Reader, cmd.SizeBytes, cmd.MimeType); err != nil {
+		metrics.AvatarsUploadsTotal.WithLabelValues("error").Inc()
 		return nil, fmt.Errorf("s3 put: %w", err)
 	}
 
@@ -89,7 +113,8 @@ func (s *Service) Upload(ctx context.Context, cmd UploadCmd) (*model.Avatar, err
 		MimeType: cmd.MimeType, SizeBytes: cmd.SizeBytes, S3Key: key,
 	})
 	if err != nil {
-		_ = s.s3.Delete(ctx, key) // компенсация
+		_ = s.s3.Delete(ctx, key)
+		metrics.AvatarsUploadsTotal.WithLabelValues("error").Inc()
 		return nil, fmt.Errorf("repo create: %w", err)
 	}
 
@@ -98,26 +123,49 @@ func (s *Service) Upload(ctx context.Context, cmd UploadCmd) (*model.Avatar, err
 	if err := s.pub.Publish(ctx, broker.AvatarTask{
 		AvatarID: created.ID.String(), OriginalKey: created.S3Key,
 	}); err != nil {
-		log.Printf("publish task %s: %v", created.ID, err)
+		slog.WarnContext(ctx, "publish task failed",
+			slog.String("avatar_id", created.ID.String()),
+			slog.String("err", err.Error()))
 	}
+
+	metrics.AvatarsUploadsTotal.WithLabelValues("success").Inc()
 	return created, nil
 }
 
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (*model.Avatar, error) {
+	ctx, span := svcTracer.Start(ctx, "avatar.get",
+		trace.WithAttributes(attribute.String("avatar_id", id.String())))
+	defer span.End()
+
 	return s.repo.Get(ctx, id)
 }
 
 func (s *Service) GetByUser(ctx context.Context, userID string) (*model.Avatar, error) {
+	ctx, span := svcTracer.Start(ctx, "avatar.get_by_user",
+		trace.WithAttributes(attribute.String("user_id", userID)))
+	defer span.End()
+
 	return s.repo.GetByUser(ctx, userID)
 }
 
 func (s *Service) ListByUser(ctx context.Context, userID string) ([]*model.Avatar, error) {
+	ctx, span := svcTracer.Start(ctx, "avatar.list_by_user",
+		trace.WithAttributes(attribute.String("user_id", userID)))
+	defer span.End()
+
 	return s.repo.ListByUser(ctx, userID)
 }
 
 // OpenFile отдаёт reader из S3 для запрошенного размера + правильный Content-Type.
 // size="" трактуется как "original".
 func (s *Service) OpenFile(ctx context.Context, a *model.Avatar, size string) (io.ReadCloser, string, error) {
+	ctx, span := svcTracer.Start(ctx, "avatar.open_file",
+		trace.WithAttributes(
+			attribute.String("avatar_id", a.ID.String()),
+			attribute.String("size", size),
+		))
+	defer span.End()
+
 	if size == "" {
 		size = "original"
 	}
@@ -147,6 +195,13 @@ func (s *Service) OpenFile(ctx context.Context, a *model.Avatar, size string) (i
 
 // Delete: авторизация владельца + soft delete в БД + best-effort очистка S3.
 func (s *Service) Delete(ctx context.Context, id uuid.UUID, requesterUserID string) error {
+	ctx, span := svcTracer.Start(ctx, "avatar.delete",
+		trace.WithAttributes(
+			attribute.String("avatar_id", id.String()),
+			attribute.String("requester_user_id", requesterUserID),
+		))
+	defer span.End()
+
 	a, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return err
@@ -163,6 +218,13 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID, requesterUserID stri
 
 // DeleteByUser удаляет последний active-аватар пользователя.
 func (s *Service) DeleteByUser(ctx context.Context, userID, requesterUserID string) error {
+	ctx, span := svcTracer.Start(ctx, "avatar.delete_by_user",
+		trace.WithAttributes(
+			attribute.String("user_id", userID),
+			attribute.String("requester_user_id", requesterUserID),
+		))
+	defer span.End()
+
 	if userID != requesterUserID {
 		return ErrForbidden
 	}
@@ -188,6 +250,8 @@ func (s *Service) cleanupS3(ctx context.Context, a *model.Avatar) {
 		AvatarID: a.ID.String(),
 		S3Keys:   keys,
 	}); err != nil {
-		log.Printf("publish delete task %s: %v", a.ID, err)
+		slog.WarnContext(ctx, "publish delete task",
+			slog.String("avatar_id", a.ID.String()),
+			slog.String("err", err.Error()))
 	}
 }

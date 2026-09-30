@@ -3,12 +3,14 @@ package http
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/riandyrn/otelchi"
 )
 
 // Server оборачивает http.Server с graceful shutdown при отмене ctx.
@@ -18,17 +20,22 @@ type Server struct {
 }
 
 // New собирает роутер и возвращает готовый сервер.
-func New(addr string, ah *AvatarHandler, hh *HealthHandler) *Server {
+func New(addr string, ah *AvatarHandler, hh *HealthHandler, logger *slog.Logger) *Server {
 	r := chi.NewRouter()
+	r.Use(otelchi.Middleware("gophprofile-http",
+		otelchi.WithChiRoutes(r)))
+	r.Use(HTTPMetrics)
+	r.Use(chimw.RequestID)
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
-	r.Use(chimw.Logger)
+	r.Use(RequestLogger(logger))
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.Timeout(30 * time.Second))
 
 	// /health и /healthz — оба возвращают глубокий статус.
 	r.Method(http.MethodGet, "/health", hh)
 	r.Method(http.MethodGet, "/healthz", hh)
+	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
 
 	// Статика фронтенда (одностраничка от Yandex Practicum).
 	r.Handle("/", http.RedirectHandler("/web/", http.StatusFound))
@@ -74,10 +81,11 @@ func New(addr string, ah *AvatarHandler, hh *HealthHandler) *Server {
 }
 
 // Run слушает на addr и корректно завершает сервер при отмене ctx.
+
 func (s *Server) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
-		log.Println("HTTP listening on", s.addr)
+		slog.Info("HTTP listening", slog.String("addr", s.addr))
 		errCh <- s.srv.ListenAndServe()
 	}()
 	select {

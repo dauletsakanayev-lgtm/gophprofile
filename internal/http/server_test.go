@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"testing"
 	"time"
@@ -12,14 +13,14 @@ import (
 func TestServer_New_ReturnsNonNil(t *testing.T) {
 	ah := NewAvatarHandler(newFakeSvc())
 	hh := NewHealthHandler(nil, nil, nil)
-	s := New(":0", ah, hh)
+	s := New(":0", ah, hh, slog.Default())
 	require.NotNil(t, s)
 }
 
 func TestServer_Run_ShutdownOnCtxCancel(t *testing.T) {
 	ah := NewAvatarHandler(newFakeSvc())
 	hh := NewHealthHandler(nil, nil, nil)
-	s := New("127.0.0.1:0", ah, hh)
+	s := New("127.0.0.1:0", ah, hh, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

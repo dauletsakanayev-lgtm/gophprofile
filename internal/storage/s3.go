@@ -8,6 +8,10 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ObjectStore — контракт объектного хранилища.
@@ -26,6 +30,8 @@ type S3Config struct {
 	Bucket    string // "avatars"
 	UseSSL    bool
 }
+
+var s3Tracer = otel.Tracer("gophprofile/storage/s3")
 
 // ErrObjectNotFound — объект по ключу отсутствует.
 var ErrObjectNotFound = errors.New("s3 object not found")
@@ -62,9 +68,21 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 // Put загружает поток в объект под ключом key. contentType — MIME тип.
 // size — точный размер (если неизвестен, передавай -1: потоковая загрузка).
 func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+	ctx, span := s3Tracer.Start(ctx, "s3.put",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("s3.bucket", s.bucket),
+			attribute.String("s3.key", key),
+			attribute.String("s3.content_type", contentType),
+			attribute.Int64("s3.size_bytes", size),
+		))
+	defer span.End()
+
 	_, err := s.client.PutObject(ctx, s.bucket, key, r, size,
 		minio.PutObjectOptions{ContentType: contentType})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("put object %s: %w", key, err)
 	}
 	return nil
@@ -73,16 +91,27 @@ func (s *S3Store) Put(ctx context.Context, key string, r io.Reader, size int64, 
 // Get отдаёт поток объекта. Вызывающий обязан вызвать Close.
 // Если объект не найден — возвращает ErrObjectNotFound.
 func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	ctx, span := s3Tracer.Start(ctx, "s3.get",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("s3.bucket", s.bucket),
+			attribute.String("s3.key", key),
+		))
+	defer span.End()
+
 	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("get object %s: %w", key, err)
 	}
-	// GetObject возвращает объект лениво — проверяем существование через Stat.
 	if _, err := obj.Stat(); err != nil {
 		_ = obj.Close()
 		if e := minio.ToErrorResponse(err); e.Code == "NoSuchKey" {
 			return nil, ErrObjectNotFound
 		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("stat object %s: %w", key, err)
 	}
 	return obj, nil
@@ -90,8 +119,18 @@ func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 
 // Delete удаляет объект. Отсутствие объекта не считается ошибкой.
 func (s *S3Store) Delete(ctx context.Context, key string) error {
+	ctx, span := s3Tracer.Start(ctx, "s3.delete",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("s3.bucket", s.bucket),
+			attribute.String("s3.key", key),
+		))
+	defer span.End()
+
 	if err := s.client.RemoveObject(ctx, s.bucket, key,
 		minio.RemoveObjectOptions{}); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("remove object %s: %w", key, err)
 	}
 	return nil
@@ -99,6 +138,14 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 
 // HealthCheck проверяет доступность S3-бакета.
 func (s *S3Store) HealthCheck(ctx context.Context) error {
+	ctx, span := s3Tracer.Start(ctx, "s3.health_check",
+		trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
+
 	_, err := s.client.BucketExists(ctx, s.bucket)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 	return err
 }

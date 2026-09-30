@@ -7,10 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/disintegration/imaging"
 	"github.com/google/uuid"
@@ -43,6 +44,11 @@ func NewProcessor(repo storage.AvatarRepository, s3 storage.ObjectStore) *Proces
 
 // Handle: pending -> processing -> completed|failed, с идемпотентностью и retry.
 func (p *Processor) Handle(ctx context.Context, task broker.AvatarTask) error {
+	start := time.Now()
+	defer func() {
+		metrics.WorkerJobDuration.WithLabelValues(broker.QueueName).Observe(time.Since(start).Seconds())
+	}()
+
 	id, err := uuid.Parse(task.AvatarID)
 	if err != nil {
 		return fmt.Errorf("bad avatar id: %w", err)
@@ -52,9 +58,12 @@ func (p *Processor) Handle(ctx context.Context, task broker.AvatarTask) error {
 	// Если сейчас processing/completed — пропускаем (не ошибка).
 	if err := p.repo.SetProcessing(ctx, id); err != nil {
 		if errors.Is(err, storage.ErrAvatarNotFound) {
-			log.Printf("worker: %s skipped (already processed or deleted)", id)
+			slog.InfoContext(ctx, "worker skipped (already processed or deleted)",
+				slog.String("avatar_id", id.String()))
+			metrics.WorkerJobsTotal.WithLabelValues(broker.QueueName, "skipped").Inc()
 			return nil
 		}
+		metrics.WorkerJobsTotal.WithLabelValues(broker.QueueName, "failed").Inc()
 		return fmt.Errorf("set processing: %w", err)
 	}
 
@@ -62,13 +71,17 @@ func (p *Processor) Handle(ctx context.Context, task broker.AvatarTask) error {
 	if procErr != nil {
 		msg := procErr.Error()
 		_ = p.repo.SetFailed(ctx, id, msg)
-		log.Printf("worker: %s failed: %v", id, procErr)
+		slog.ErrorContext(ctx, "worker task failed",
+			slog.String("avatar_id", id.String()),
+			slog.String("err", procErr.Error()))
+		metrics.WorkerJobsTotal.WithLabelValues(broker.QueueName, "failed").Inc()
 		return procErr
 	}
 
 	if err := p.repo.SetCompleted(ctx, id, thumbs, width, height); err != nil {
 		return fmt.Errorf("set completed: %w", err)
 	}
+	metrics.WorkerJobsTotal.WithLabelValues(broker.QueueName, "success").Inc()
 	return nil
 }
 
@@ -81,7 +94,11 @@ func (p *Processor) processWithRetry(ctx context.Context, id uuid.UUID, original
 			return thumbs, w, h, nil
 		}
 		lastErr = err
-		log.Printf("worker: %s attempt %d/%d failed: %v", id, attempt, maxAttempts, err)
+		slog.WarnContext(ctx, "worker attempt failed",
+			slog.String("avatar_id", id.String()),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", maxAttempts),
+			slog.String("err", err.Error()))
 		if attempt < maxAttempts {
 			backoff := baseBackoff << (attempt - 1)
 			select {

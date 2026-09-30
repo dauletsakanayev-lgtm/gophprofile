@@ -3,15 +3,19 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/logging"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/service"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/tracing"
 )
 
 const (
@@ -22,29 +26,50 @@ const (
 	defaultS3Bucket    = "avatars"
 	defaultAMQP        = "amqp://guest:guest@localhost:5673/"
 	defaultHTTPAddr    = ":8080"
+	defaultLogLevel    = "info"
+	defaultOTLP        = "localhost:4317"
 )
 
 func main() {
+	logger := logging.New(envOr("LOG_LEVEL", defaultLogLevel))
+	slog.SetDefault(logger)
+
+	// OpenTelemetry
+	ctxInit := context.Background()
+	shutdown, err := tracing.Init(ctxInit, "gophprofile-server",
+		envOr("OTEL_EXPORTER_OTLP_ENDPOINT", defaultOTLP))
+	if err != nil {
+		slog.Error("tracing init", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(shutCtx)
+	}()
+	slog.Info("tracing initialized")
+
 	dsn := envOr("DB_DSN", defaultDSN)
 
-	log.Println("gophprofile-server: connecting to postgres...")
+	slog.Info("gophprofile-server starting")
 	db, err := storage.Open(dsn)
 	if err != nil {
-		log.Fatalf("open db: %v", err)
+		slog.Error("open db", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
 	defer db.Close()
 
-	log.Println("applying migrations...")
+	slog.Info("applying migrations")
 	if err := storage.Migrate(db); err != nil {
-		log.Fatalf("migrate: %v", err)
+		slog.Error("migrate", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
-	log.Println("migrations applied successfully")
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
 
-	log.Println("connecting to S3/MinIO...")
+	slog.Info("connecting to S3/MinIO")
 	s3, err := storage.NewS3Store(ctx, storage.S3Config{
 		Endpoint:  envOr("S3_ENDPOINT", defaultS3Endpoint),
 		AccessKey: envOr("S3_ACCESS_KEY", defaultS3AccessKey),
@@ -53,29 +78,47 @@ func main() {
 		UseSSL:    false,
 	})
 	if err != nil {
-		log.Fatalf("s3 init: %v", err)
+		slog.Error("s3 init", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
-	log.Println("S3 bucket ready:", defaultS3Bucket)
+	slog.Info("S3 bucket ready", slog.String("bucket", defaultS3Bucket))
 
-	log.Println("connecting to RabbitMQ...")
+	slog.Info("connecting to RabbitMQ")
 	amqpConn, amqpCh, err := broker.Connect(envOr("AMQP_URL", defaultAMQP))
 	if err != nil {
-		log.Fatalf("amqp connect: %v", err)
+		slog.Error("amqp connect", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
 	defer amqpConn.Close()
 	defer amqpCh.Close()
-	log.Println("RabbitMQ queue ready:", broker.QueueName)
+	slog.Info("RabbitMQ queue ready", slog.String("queue", broker.QueueName))
 
 	pub := broker.NewPublisher(amqpCh)
+
+	// Метрики: DB connections + storage bytes + queue depth
+	metrics.RegisterDBStats(db)
+	metrics.StartStorageCollector(ctx, db, 30*time.Second)
+
+	// Отдельный AMQP канал для queue-depth collector'а, чтобы не мешать publisher'у
+	depthCh, err := amqpConn.Channel()
+	if err != nil {
+		slog.Error("open depth channel", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+	defer depthCh.Close()
+	broker.StartQueueDepthCollector(ctx, depthCh, 15*time.Second)
+
 	repo := storage.NewPostgresAvatarRepo(db)
 	svc := service.New(repo, s3, pub)
 	ah := httpsrv.NewAvatarHandler(svc)
 	hh := httpsrv.NewHealthHandler(db, s3, amqpCh)
-	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh)
+	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh, logger)
 
 	if err := srv.Run(ctx); err != nil {
-		log.Fatalf("http server: %v", err)
+		slog.Error("http server", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
+	slog.Info("shutdown complete")
 }
 
 func envOr(key, def string) string {
