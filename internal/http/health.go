@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -57,7 +57,8 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func pingDB(ctx context.Context, db *sql.DB) string {
 	if err := db.PingContext(ctx); err != nil {
-		log.Printf("health: DB ping failed: %v", err)
+		slog.WarnContext(ctx, "health: DB ping failed",
+			slog.String("err", err.Error()))
 		return "down"
 	}
 	return "ok"
@@ -65,7 +66,8 @@ func pingDB(ctx context.Context, db *sql.DB) string {
 
 func pingS3(ctx context.Context, s3 *storage.S3Store) string {
 	if err := s3.HealthCheck(ctx); err != nil {
-		log.Printf("health: S3 check failed: %v", err)
+		slog.WarnContext(ctx, "health: S3 check failed",
+			slog.String("err", err.Error()))
 		return "down"
 	}
 	return "ok"
@@ -77,7 +79,8 @@ func pingBroker(ch *amqp.Channel) string {
 		return "down"
 	}
 	if _, err := ch.QueueDeclarePassive(broker.QueueName, true, false, false, false, nil); err != nil {
-		log.Printf("health: broker check failed: %v", err)
+		slog.Warn("health: broker check failed",
+			slog.String("err", err.Error()))
 		return "down"
 	}
 	return "ok"

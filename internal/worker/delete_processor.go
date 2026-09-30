@@ -3,8 +3,10 @@ package worker
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 )
 
@@ -20,10 +22,16 @@ func NewDeleteProcessor(s3 storage.ObjectStore) *DeleteProcessor {
 // Handle — best-effort удаление всех ключей задачи.
 // Ошибка на одном ключе не мешает удалению остальных.
 func (p *DeleteProcessor) Handle(ctx context.Context, task broker.DeleteTask) error {
+	start := time.Now()
+	defer func() {
+		metrics.WorkerJobDuration.WithLabelValues(broker.DeleteQueueName).Observe(time.Since(start).Seconds())
+	}()
+
 	for _, key := range task.S3Keys {
 		if err := p.s3.Delete(ctx, key); err != nil {
 			log.Printf("delete-worker: %s key=%s: %v", task.AvatarID, key, err)
 		}
 	}
+	metrics.WorkerJobsTotal.WithLabelValues(broker.DeleteQueueName, "success").Inc()
 	return nil
 }

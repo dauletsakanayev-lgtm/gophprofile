@@ -7,15 +7,18 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/XSAM/otelsql"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/db"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // Open открывает пул соединений к PostgreSQL и проверяет доступность.
 func Open(dsn string) (*sql.DB, error) {
-	pool, err := sql.Open("pgx", dsn)
+	pool, err := otelsql.Open("pgx", dsn,
+		otelsql.WithAttributes(semconv.DBSystemPostgreSQL))
 	if err != nil {
-		return nil, fmt.Errorf("sql.Open: %w", err)
+		return nil, fmt.Errorf("otelsql.Open: %w", err)
 	}
 	if err := pool.Ping(); err != nil {
 		_ = pool.Close()

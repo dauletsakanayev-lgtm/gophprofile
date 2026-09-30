@@ -5,13 +5,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Handler — функция обработки одной задачи.
 type Handler func(ctx context.Context, task AvatarTask) error
+
+// extractCtx извлекает trace-context из AMQP-headers.
+func extractCtx(base context.Context, headers amqp.Table) context.Context {
+	carrier := propagation.MapCarrier{}
+	for k, v := range headers {
+		if s, ok := v.(string); ok {
+			carrier[k] = s
+		}
+	}
+	return otel.GetTextMapPropagator().Extract(base, carrier)
+}
 
 // Consume подписывается на очередь и передаёт каждое сообщение в handler.
 // Prefetch=1 — по одному сообщению за раз, ack только после успеха.
@@ -39,15 +55,33 @@ func Consume(ctx context.Context, ch *amqp.Channel, handler Handler) error {
 }
 
 func processOne(ctx context.Context, msg amqp.Delivery, handler Handler) {
+	ctx = extractCtx(ctx, msg.Headers)
+	ctx, span := brokerTracer.Start(ctx, "amqp.consume "+QueueName,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.source", QueueName),
+		))
+	defer span.End()
+
 	var task AvatarTask
 	if err := json.Unmarshal(msg.Body, &task); err != nil {
-		log.Printf("broker: bad message body: %v", err)
-		_ = msg.Nack(false, false) // без requeue — payload битый
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		slog.ErrorContext(ctx, "broker: bad message body",
+			slog.String("err", err.Error()))
+		_ = msg.Nack(false, false)
 		return
 	}
+	span.SetAttributes(attribute.String("avatar_id", task.AvatarID))
+
 	if err := handler(ctx, task); err != nil {
-		log.Printf("broker: handler failed for %s: %v", task.AvatarID, err)
-		_ = msg.Nack(false, false) // без requeue — статус уже failed в БД
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		slog.ErrorContext(ctx, "broker: handler failed",
+			slog.String("avatar_id", task.AvatarID),
+			slog.String("err", err.Error()))
+		_ = msg.Nack(false, false)
 		return
 	}
 	_ = msg.Ack(false)
@@ -70,18 +104,40 @@ func ConsumeDelete(ctx context.Context, ch *amqp.Channel, handler DeleteHandler)
 			if !ok {
 				return errors.New("delete consumer channel closed")
 			}
-			var task DeleteTask
-			if err := json.Unmarshal(msg.Body, &task); err != nil {
-				log.Printf("broker: bad delete message: %v", err)
-				_ = msg.Nack(false, false)
-				continue
-			}
-			if err := handler(ctx, task); err != nil {
-				log.Printf("broker: delete handler failed for %s: %v", task.AvatarID, err)
-				_ = msg.Nack(false, false)
-				continue
-			}
-			_ = msg.Ack(false)
+			processDeleteOne(ctx, msg, handler)
 		}
 	}
+}
+
+func processDeleteOne(ctx context.Context, msg amqp.Delivery, handler DeleteHandler) {
+	ctx = extractCtx(ctx, msg.Headers)
+	ctx, span := brokerTracer.Start(ctx, "amqp.consume "+DeleteQueueName,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.source", DeleteQueueName),
+		))
+	defer span.End()
+
+	var task DeleteTask
+	if err := json.Unmarshal(msg.Body, &task); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		slog.ErrorContext(ctx, "broker: bad delete message",
+			slog.String("err", err.Error()))
+		_ = msg.Nack(false, false)
+		return
+	}
+	span.SetAttributes(attribute.String("avatar_id", task.AvatarID))
+
+	if err := handler(ctx, task); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		slog.ErrorContext(ctx, "broker: delete handler failed",
+			slog.String("avatar_id", task.AvatarID),
+			slog.String("err", err.Error()))
+		_ = msg.Nack(false, false)
+		return
+	}
+	_ = msg.Ack(false)
 }
