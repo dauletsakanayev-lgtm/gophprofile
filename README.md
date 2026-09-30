@@ -1,5 +1,8 @@
 # GophProfile
 
+![CI](https://github.com/dauletsakanayev-lgtm/gophprofile/actions/workflows/ci.yml/badge.svg)
+
+
 Микросервис управления аватарками пользователей — учебный проект курса «Go-разработчик» от Yandex Practicum.
 
 ## Стек

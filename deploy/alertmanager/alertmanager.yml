@@ -1,0 +1,24 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+  routes:
+    # Demo алерт — блэкхол, чтобы не спамить.
+    - matchers:
+        - demo="true"
+      receiver: blackhole
+
+receivers:
+  - name: default
+    webhook_configs:
+      # Заглушка — просто ходим на несуществующий URL.
+      # В проде подключить slack/email/pagerduty.
+      - url: 'http://localhost:5001/'
+        send_resolved: true
+
+  - name: blackhole

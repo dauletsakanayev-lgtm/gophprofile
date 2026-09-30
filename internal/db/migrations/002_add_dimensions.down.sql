@@ -1,0 +1,2 @@
+ALTER TABLE avatars DROP COLUMN IF EXISTS height_px;
+ALTER TABLE avatars DROP COLUMN IF EXISTS width_px;
