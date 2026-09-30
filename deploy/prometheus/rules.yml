@@ -1,0 +1,57 @@
+groups:
+  - name: gophprofile
+    rules:
+      # RED-алерты по ТЗ
+      - alert: HighHTTPErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP 5xx error rate (>10%)"
+          description: "5xx error rate is {{ $value | humanizePercentage }} over 5 minutes."
+
+      - alert: HighRequestLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m]))) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High request latency (p95 > 5s)"
+          description: "p95 latency is {{ $value }}s over 2 minutes."
+
+      # Бизнес-алерты
+      - alert: WorkerJobFailures
+        expr: |
+          sum by (queue) (rate(worker_jobs_processed_total{status="failed"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker job failures on queue {{ $labels.queue }}"
+          description: "Failure rate: {{ $value }}/s"
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.job }} is DOWN"
+          description: "Scrape target {{ $labels.instance }} is unreachable for 1 minute."
+
+      # Тестовый алерт для демонстрации — стреляет когда target UP.
+      # Удалить когда демонстрация не нужна.
+      - alert: TestAlertDemo
+        expr: up == 1
+        for: 30s
+        labels:
+          severity: info
+          demo: "true"
+        annotations:
+          summary: "Test alert (demo) — fires while target is up"
+          description: "Just to prove Alertmanager receives alerts."
