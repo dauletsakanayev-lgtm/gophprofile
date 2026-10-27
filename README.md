@@ -108,9 +108,32 @@ flowchart LR
 
 ### Observability
 
-- **Логи** — JSON через `slog` (`log/slog`); в docker-compose Fluent Bit → OpenSearch; в K8s — через `kubectl logs` / Loki (не входит в sprint).
-- **Метрики** — Prometheus endpoint `/metrics` на `:8080` (server) и `:8081` (worker). Собственные метрики: counters uploads/thumbnails, histograms upload duration, gauges queue depth / storage bytes / DB connections.
-- **Трейсы** — OpenTelemetry с OTLP exporter (gRPC) в Jaeger. HTTP server инструментирован через `otelchi`; AMQP context propagation через headers.
+- **Логи** — JSON через `slog` (`log/slog`); в `docker-compose` Fluent Bit → OpenSearch ([UI](http://localhost:5601)); в K8s — через `kubectl logs` / Loki (не входит в sprint).
+
+- **Метрики** — Prometheus endpoint `/metrics` на `:8080` (server) и `:8081` (worker). Собственные метрики: counters uploads/thumbnails, histograms upload duration, gauges queue depth / storage bytes / DB connections. В `docker-compose` сервис Prometheus доступен на [:9090](http://localhost:9090). В K8s — через [`ServiceMonitor`](deploy/helm/gophprofile/templates/servicemonitor.yaml) (требует prometheus-operator).
+
+- **Трейсы** — OpenTelemetry с OTLP exporter (gRPC) в Jaeger ([UI](http://localhost:16686)). HTTP server инструментирован через `otelchi`; AMQP context propagation через headers.
+
+- **Алерты** — Alertmanager ([UI](http://localhost:9093)) + правила Prometheus в [deploy/prometheus/rules.yml](deploy/prometheus/rules.yml):
+
+  | Alert | Условие | Severity |
+  |---|---|---|
+  | `HighHTTPErrorRate` | >10% HTTP 5xx за 5 минут | warning |
+  | `HighRequestLatency` | p95 задержки HTTP > 5s за 2 минуты | critical |
+  | `WorkerJobFailures` | > 5% ошибок обработки задач за 5 минут | warning |
+  | `TargetDown` | scrape target недоступен > 1 минуты | critical |
+
+  Alertmanager в `docker-compose` настроен на webhook-заглушку ([deploy/alertmanager/alertmanager.yml](deploy/alertmanager/alertmanager.yml)). В production подключается Slack / email / PagerDuty через `receivers`.
+
+- **Дашборды Grafana** — в [deploy/grafana/dashboards/](deploy/grafana/dashboards/), доступны на [:3000](http://localhost:3000) (admin/admin). Автопровижининг через [deploy/grafana/provisioning/](deploy/grafana/provisioning/). В K8s стек поднимается через `kube-prometheus-stack` (не входит в sprint, но ServiceMonitor + rules готовы к интеграции).
+
+### Resilience
+
+- **Rate limiting** — [`go-chi/httprate`](https://github.com/go-chi/httprate), 10 запросов/мин на `X-User-ID` (fallback: IP) для `POST /api/v1/avatars`. Превышение → 429 `{"error":"Rate limit exceeded"}`.
+
+- **Circuit breaker** — [`sony/gobreaker`](https://github.com/sony/gobreaker), обёртки в [internal/resilience/](internal/resilience/) для S3, RabbitMQ, Postgres. При ≥5 ошибках подряд или failure rate >60% на окне ≥10 запросов — breaker открывается на 10 секунд, запросы отклоняются мгновенно без обращения к зависимости. State changes логируются как `WARN: circuit breaker state change`.
+
+- **Graceful shutdown** — `signal.NotifyContext` на SIGTERM/SIGINT/SIGQUIT, `http.Server.Shutdown` с 10s таймаутом. В Helm: `preStop` sleep (чтобы Service успел убрать под из endpoints) + `terminationGracePeriodSeconds: 30`.
 
 
 ### API документация
@@ -132,7 +155,7 @@ flowchart LR
 | `Ingress` nginx | Хост `avatars.local`, `proxy-body-size: 10m` (10MB upload по ТЗ) |
 | `HPA` autoscaling/v2 | CPU 70% + Memory 80%, scale-up/down behavior |
 | `ConfigMap` + `Secret` | Через `envFrom`; checksum-аннотации → rolling restart при изменении |
-| `NetworkPolicy` | default-deny + allow ingress-nginx + allow Prometheus scrape |
+| `NetworkPolicy` | default-deny Ingress+Egress + allow ingress-nginx + allow Prometheus scrape + allow egress на Postgres/MinIO/RabbitMQ/OTLP. **Внимание:** kindnet CNI в kind кластере не enforce'ит NetworkPolicy — манифесты правильные, но реально блокируют трафик только с совместимым CNI (Calico, Cilium) в prod-кластере |
 | `ServiceMonitor` | Для prometheus-operator (CRD) |
 | `ServiceAccount` | `automountServiceAccountToken: false` |
 

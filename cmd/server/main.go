@@ -16,6 +16,7 @@ import (
 	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/logging"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/resilience"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/service"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/tracing"
@@ -140,9 +141,17 @@ func run() error {
 	defer depthCh.Close()
 	broker.StartQueueDepthCollector(ctx, depthCh, 15*time.Second)
 
-	repo := storage.NewPostgresAvatarRepo(db)
-	svc := service.New(repo, s3, pub)
+	// Внешние зависимости оборачиваем в circuit breaker'ы (защита от каскадного
+	// отказа при деградации). При превышении лимита ошибок breaker переходит в
+	// Open и возвращает ErrOpenState мгновенно, не трогая реальный ресурс.
+	repo := resilience.NewAvatarRepo(storage.NewPostgresAvatarRepo(db))
+	cbS3 := resilience.NewS3Store(s3)
+	cbPub := resilience.NewPublisher(pub)
+
+	svc := service.New(repo, cbS3, cbPub)
 	ah := httpsrv.NewAvatarHandler(svc)
+	// Для healthz используем сырой s3/amqpCh — проверяется реальная доступность,
+	// не состояние breaker'а.
 	hh := httpsrv.NewHealthHandler(db, s3, amqpCh)
 	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh, logger)
 

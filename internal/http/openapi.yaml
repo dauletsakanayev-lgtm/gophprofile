@@ -68,6 +68,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit — слишком много запросов (10/мин на X-User-ID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /api/v1/avatars/{id}:
     get:

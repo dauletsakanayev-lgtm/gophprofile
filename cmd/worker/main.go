@@ -14,6 +14,7 @@ import (
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/logging"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/resilience"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/tracing"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/worker"
@@ -107,9 +108,10 @@ func run() error {
 	}
 	defer delCh.Close()
 
-	repo := storage.NewPostgresAvatarRepo(db)
-	proc := worker.NewProcessor(repo, s3)
-	delProc := worker.NewDeleteProcessor(s3)
+	repo := resilience.NewAvatarRepo(storage.NewPostgresAvatarRepo(db))
+	cbS3 := resilience.NewS3Store(s3)
+	proc := worker.NewProcessor(repo, cbS3)
+	delProc := worker.NewDeleteProcessor(cbS3)
 
 	slog.Info("worker consuming",
 		slog.String("upload_queue", broker.QueueName),
