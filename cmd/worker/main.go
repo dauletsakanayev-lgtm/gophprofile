@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,6 +32,13 @@ const (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	logger := logging.New(envOr("LOG_LEVEL", defaultLogLevel))
 	slog.SetDefault(logger)
 
@@ -39,8 +47,7 @@ func main() {
 	shutdown, err := tracing.Init(ctxInit, "gophprofile-worker",
 		envOr("OTEL_EXPORTER_OTLP_ENDPOINT", defaultOTLP))
 	if err != nil {
-		slog.Error("tracing init", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("tracing init: %w", err)
 	}
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -72,8 +79,7 @@ func main() {
 
 	db, err := storage.Open(envOr("DB_DSN", defaultDSN))
 	if err != nil {
-		slog.Error("open db", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("open db: %w", err)
 	}
 	defer db.Close()
 
@@ -85,22 +91,19 @@ func main() {
 		UseSSL:    false,
 	})
 	if err != nil {
-		slog.Error("s3 init", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("s3 init: %w", err)
 	}
 
 	conn, ch, err := broker.Connect(envOr("AMQP_URL", defaultAMQP))
 	if err != nil {
-		slog.Error("amqp connect", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("amqp connect: %w", err)
 	}
 	defer conn.Close()
 	defer ch.Close()
 
 	delCh, err := conn.Channel()
 	if err != nil {
-		slog.Error("open delete channel", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("open delete channel: %w", err)
 	}
 	defer delCh.Close()
 
@@ -117,10 +120,10 @@ func main() {
 	go func() { errCh <- broker.ConsumeDelete(ctx, delCh, delProc.Handle) }()
 
 	if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("consume", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("consume: %w", err)
 	}
 	slog.Info("worker shutdown")
+	return nil
 }
 
 func envOr(key, def string) string {

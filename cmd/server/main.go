@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -31,6 +32,13 @@ const (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	logger := logging.New(envOr("LOG_LEVEL", defaultLogLevel))
 	slog.SetDefault(logger)
 
@@ -39,8 +47,7 @@ func main() {
 	shutdown, err := tracing.Init(ctxInit, "gophprofile-server",
 		envOr("OTEL_EXPORTER_OTLP_ENDPOINT", defaultOTLP))
 	if err != nil {
-		slog.Error("tracing init", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("tracing init: %w", err)
 	}
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -49,20 +56,16 @@ func main() {
 	}()
 	slog.Info("tracing initialized")
 
-	dsn := envOr("DB_DSN", defaultDSN)
-
 	slog.Info("gophprofile-server starting")
-	db, err := storage.Open(dsn)
+	db, err := storage.Open(envOr("DB_DSN", defaultDSN))
 	if err != nil {
-		slog.Error("open db", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("open db: %w", err)
 	}
 	defer db.Close()
 
 	slog.Info("applying migrations")
 	if err := storage.Migrate(db); err != nil {
-		slog.Error("migrate", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("migrate: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(),
@@ -78,16 +81,14 @@ func main() {
 		UseSSL:    false,
 	})
 	if err != nil {
-		slog.Error("s3 init", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("s3 init: %w", err)
 	}
-	slog.Info("S3 bucket ready", slog.String("bucket", defaultS3Bucket))
+	slog.Info("S3 bucket ready", slog.String("bucket", envOr("S3_BUCKET", defaultS3Bucket)))
 
 	slog.Info("connecting to RabbitMQ")
 	amqpConn, amqpCh, err := broker.Connect(envOr("AMQP_URL", defaultAMQP))
 	if err != nil {
-		slog.Error("amqp connect", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("amqp connect: %w", err)
 	}
 	defer amqpConn.Close()
 	defer amqpCh.Close()
@@ -102,8 +103,7 @@ func main() {
 	// Отдельный AMQP канал для queue-depth collector'а, чтобы не мешать publisher'у
 	depthCh, err := amqpConn.Channel()
 	if err != nil {
-		slog.Error("open depth channel", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("open depth channel: %w", err)
 	}
 	defer depthCh.Close()
 	broker.StartQueueDepthCollector(ctx, depthCh, 15*time.Second)
@@ -115,10 +115,10 @@ func main() {
 	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh, logger)
 
 	if err := srv.Run(ctx); err != nil {
-		slog.Error("http server", slog.String("err", err.Error()))
-		os.Exit(1)
+		return fmt.Errorf("http server: %w", err)
 	}
 	slog.Info("shutdown complete")
+	return nil
 }
 
 func envOr(key, def string) string {
