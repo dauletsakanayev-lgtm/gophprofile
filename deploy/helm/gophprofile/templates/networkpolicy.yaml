@@ -1,5 +1,5 @@
 {{- if .Values.networkPolicy.enabled -}}
-# Default deny всего ingress-трафика в неймспейсе релиза.
+# Default deny: все ingress + egress в неймспейсе релиза (кроме DNS).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -12,9 +12,20 @@ spec:
       {{- include "gophprofile.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
-  ingress: []
+    - Egress
+  # Egress: разрешаем DNS (нужен для резолва DNS-имён сервисов)
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
 ---
-# Разрешаем входящий трафик на server:8080 из ingress-nginx namespace.
+# Ingress: разрешаем входящий трафик на server:8080 из ingress-nginx namespace.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -36,7 +47,7 @@ spec:
         - protocol: TCP
           port: {{ .Values.server.containerPort }}
 ---
-# Разрешаем Prometheus скрейпить /metrics server и worker.
+# Ingress: разрешаем Prometheus скрейпить /metrics server и worker.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -59,4 +70,47 @@ spec:
           port: {{ .Values.server.containerPort }}
         - protocol: TCP
           port: {{ .Values.worker.metricsPort }}
+---
+# Egress: разрешаем доступ к инфраструктуре (Postgres, MinIO, RabbitMQ, Jaeger).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "gophprofile.fullname" . }}-allow-egress-infra
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gophprofile.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # PostgreSQL (bitnami chart — labels: app.kubernetes.io/name=postgresql)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
+    # MinIO (labels: app=minio из infra.yaml)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # RabbitMQ (labels: app=rabbitmq из infra.yaml)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: rabbitmq
+      ports:
+        - protocol: TCP
+          port: 5672
+    # OpenTelemetry collector / Jaeger (OTLP gRPC) — любой namespace
+    - ports:
+        - protocol: TCP
+          port: 4317
 {{- end }}

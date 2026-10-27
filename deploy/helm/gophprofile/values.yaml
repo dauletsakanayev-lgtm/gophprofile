@@ -107,6 +107,9 @@ config:
   s3Bucket: "avatars"
   s3UseSSL: "false"
   otelEndpoint: "jaeger-collector.observability.svc.cluster.local:4317"
+  # Бизнес-правила загрузки (переопределение дефолтов из кода)
+  maxFileSize: "10485760"  # 10 MB в байтах
+  allowedMimeTypes: "image/jpeg,image/png,image/webp"
 
 # ============================================================
 # Secrets (DSN/пароли → Secret, ENV)
@@ -119,6 +122,20 @@ secrets:
   s3SecretKey: "minioadmin"
   amqpUrl: "amqp://user:pass@gophprofile-rabbitmq:5672/"
 
+# ============================================================
+# Migrate — Helm hook job для миграций БД перед install/upgrade
+# ============================================================
+migrate:
+  enabled: true
+  backoffLimit: 3
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+      
 # ============================================================
 # ServiceAccount
 # ============================================================

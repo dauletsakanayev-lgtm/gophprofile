@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/broker"
@@ -32,13 +33,37 @@ var (
 )
 
 // MaxUploadBytes — лимит размера загружаемого файла (10 MB по ТЗ).
-const MaxUploadBytes int64 = 10 << 20
+// var (а не const) чтобы можно было переопределить из ConfigMap через Configure().
+var MaxUploadBytes int64 = 10 << 20
 
-// allowedMIME — разрешённые типы файлов.
+// allowedMIME — разрешённые типы файлов. Переопределяется через Configure().
 var allowedMIME = map[string]struct{}{
 	"image/jpeg": {},
 	"image/png":  {},
 	"image/webp": {},
+}
+
+// Configure перенастраивает глобальные бизнес-правила загрузки из конфигурации.
+// Вызывается один раз из main() при старте. Нулевые/пустые параметры — не меняют текущее значение.
+//
+// maxFileSize — лимит в байтах; 0 → не меняем.
+// allowedMIMETypes — список MIME типов, запятая-разделитель уже разобран; nil/[] → не меняем.
+func Configure(maxFileSize int64, allowedMIMETypes []string) {
+	if maxFileSize > 0 {
+		MaxUploadBytes = maxFileSize
+	}
+	if len(allowedMIMETypes) > 0 {
+		m := make(map[string]struct{}, len(allowedMIMETypes))
+		for _, t := range allowedMIMETypes {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				m[t] = struct{}{}
+			}
+		}
+		if len(m) > 0 {
+			allowedMIME = m
+		}
+	}
 }
 
 // UploadCmd — параметры операции загрузки.

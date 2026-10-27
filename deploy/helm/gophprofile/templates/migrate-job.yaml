@@ -1,0 +1,58 @@
+{{- if .Values.migrate.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gophprofile.fullname" . }}-migrate
+  labels:
+    {{- include "gophprofile.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Запуск pre-install (чистая установка) и pre-upgrade (новая версия чарта).
+    "helm.sh/hook": pre-install,pre-upgrade
+    # weight=-5 → job'а запускается раньше остальных ресурсов (которых по умолчанию 0).
+    "helm.sh/hook-weight": "-5"
+    # Удалять предыдущую job'у перед созданием новой и после успешного завершения.
+    # Если миграция упадёт — Job и логи остаются для разбора.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # TTL: удалить завершённую Job через 10 минут (бэкап, если hook-delete-policy не сработает).
+  ttlSecondsAfterFinished: 600
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "gophprofile.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "gophprofile.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: MIGRATE_ONLY
+              value: "true"
+          envFrom:
+            - configMapRef:
+                name: {{ include "gophprofile.fullname" . }}-config
+            - secretRef:
+                name: {{ include "gophprofile.fullname" . }}-secret
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

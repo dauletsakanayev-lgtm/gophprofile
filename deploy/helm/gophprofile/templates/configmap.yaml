@@ -10,3 +10,5 @@ data:
   S3_BUCKET: {{ .Values.config.s3Bucket | quote }}
   S3_USE_SSL: {{ .Values.config.s3UseSSL | quote }}
   OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  MAX_FILE_SIZE: {{ .Values.config.maxFileSize | quote }}
+  ALLOWED_MIME_TYPES: {{ .Values.config.allowedMimeTypes | quote }}

@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,6 +68,36 @@ func run() error {
 	slog.Info("applying migrations")
 	if err := storage.Migrate(db); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+
+	// MIGRATE_ONLY=true → этот процесс используется Helm pre-install/pre-upgrade
+	// hook'ом только для прогона миграций; HTTP-сервер не стартуем, defer'ы
+	// (shutdown trace exporter, close db) отрабатывают, exit 0.
+	if envOr("MIGRATE_ONLY", "") == "true" {
+		slog.Info("migrate-only mode: migrations applied, exiting")
+		return nil
+	}
+
+	// Переопределение бизнес-правил из ConfigMap: MAX_FILE_SIZE (байты)
+	// и ALLOWED_MIME_TYPES (CSV). Пустые значения — остаются дефолты из service.
+	var maxFileSize int64
+	if v := envOr("MAX_FILE_SIZE", ""); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxFileSize = n
+		} else {
+			slog.Warn("ignoring invalid MAX_FILE_SIZE",
+				slog.String("value", v),
+				slog.String("err", "parse int or non-positive"))
+		}
+	}
+	var mimeTypes []string
+	if v := envOr("ALLOWED_MIME_TYPES", ""); v != "" {
+		mimeTypes = strings.Split(v, ",")
+	}
+	if maxFileSize > 0 || len(mimeTypes) > 0 {
+		service.Configure(maxFileSize, mimeTypes)
+		slog.Info("service configured from env",
+			slog.Int64("max_file_size", service.MaxUploadBytes))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(),

@@ -37,6 +37,11 @@ func New(addr string, ah *AvatarHandler, hh *HealthHandler, logger *slog.Logger)
 	r.Method(http.MethodGet, "/healthz", hh)
 	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
 
+	// OpenAPI/Swagger
+	r.Get("/openapi.yaml", serveOpenAPISpec)
+	r.Get("/swagger", serveSwaggerUI)
+	r.Get("/swagger/", serveSwaggerUI)
+
 	// Статика фронтенда (одностраничка от Yandex Practicum).
 	r.Handle("/", http.RedirectHandler("/web/", http.StatusFound))
 

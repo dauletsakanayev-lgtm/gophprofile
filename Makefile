@@ -1,8 +1,8 @@
 BIN_DIR := bin
 
-.PHONY: build test cover lint fmt db-up db-down
+.PHONY: build test cover lint fmt db-up db-down openapi-sync
 
-build:
+build: openapi-sync
 	@mkdir -p $(BIN_DIR)
 	go build -o $(BIN_DIR)/server ./cmd/server
 	go build -o $(BIN_DIR)/worker ./cmd/worker
@@ -25,3 +25,10 @@ db-up:
 
 db-down:
 	docker compose down
+
+# openapi-sync — синхронизирует openapi.yaml в internal/http (где он нужен для go:embed)
+# с source of truth в api/openapi.yaml.
+openapi-sync:
+	cp api/openapi.yaml internal/http/openapi.yaml
+	@echo "openapi.yaml synced"	
+
