@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gophprofile.fullname" . }}-worker
+  labels:
+    {{- include "gophprofile.worker.labels" . | nindent 4 }}
+spec:
+  # Headless Service — DNS без ClusterIP, нужен только для ServiceMonitor
+  # (Prometheus скрейпит endpoints напрямую с подов).
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: {{ .Values.worker.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "gophprofile.worker.selectorLabels" . | nindent 4 }}

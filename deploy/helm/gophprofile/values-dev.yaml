@@ -1,0 +1,21 @@
+server:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+
+worker:
+  replicaCount: 1
+
+ingress:
+  host: avatars.local
+
+serviceMonitor:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+image:
+  pullPolicy: IfNotPresent
+workerImage:
+  pullPolicy: IfNotPresent

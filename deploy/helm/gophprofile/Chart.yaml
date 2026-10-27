@@ -1,0 +1,9 @@
+apiVersion: v2
+name: gophprofile
+description: GophProfile avatar microservice — Helm Chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: Daulet Sakanayev
+    email: daulet.sakanayev@sulpak.kz
