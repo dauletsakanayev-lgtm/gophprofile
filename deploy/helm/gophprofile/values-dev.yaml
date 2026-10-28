@@ -1,0 +1,39 @@
+# Dev-окружение — локальный kind кластер.
+# Включены ServiceMonitor + HPA + NetworkPolicy (metrics-server + kube-prometheus-stack поставлены).
+
+server:
+  replicaCount: 2           # для демо load balancing
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    # Понижаем порог для демо — любая нагрузка триггернёт scale.
+    # В prod ставить обратно 70%+.
+    targetCPUUtilizationPercentage: 20
+    targetMemoryUtilizationPercentage: 60
+  resources:
+    requests:
+      cpu: "20m"            # мин. значение, чтобы 20% порог = 4m — легко переступить
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+
+worker:
+  replicaCount: 1
+
+ingress:
+  host: avatars.local
+
+serviceMonitor:
+  enabled: true             # prometheus-operator стоит → Prometheus подхватит
+  labels:
+    release: prometheus     # kube-prometheus-stack ищет ServiceMonitor с этим лейблом
+
+networkPolicy:
+  enabled: true             # NetworkPolicy создаются (kindnet их не enforce'ит, но для демо описаны)
+
+image:
+  pullPolicy: IfNotPresent
+workerImage:
+  pullPolicy: IfNotPresent

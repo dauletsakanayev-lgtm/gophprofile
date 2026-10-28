@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	httpsrv "github.com/dauletsakanayev-lgtm/gophprofile/internal/http"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/logging"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/metrics"
+	"github.com/dauletsakanayev-lgtm/gophprofile/internal/resilience"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/service"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/storage"
 	"github.com/dauletsakanayev-lgtm/gophprofile/internal/tracing"
@@ -68,6 +71,36 @@ func run() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
+	// MIGRATE_ONLY=true → этот процесс используется Helm pre-install/pre-upgrade
+	// hook'ом только для прогона миграций; HTTP-сервер не стартуем, defer'ы
+	// (shutdown trace exporter, close db) отрабатывают, exit 0.
+	if envOr("MIGRATE_ONLY", "") == "true" {
+		slog.Info("migrate-only mode: migrations applied, exiting")
+		return nil
+	}
+
+	// Переопределение бизнес-правил из ConfigMap: MAX_FILE_SIZE (байты)
+	// и ALLOWED_MIME_TYPES (CSV). Пустые значения — остаются дефолты из service.
+	var maxFileSize int64
+	if v := envOr("MAX_FILE_SIZE", ""); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxFileSize = n
+		} else {
+			slog.Warn("ignoring invalid MAX_FILE_SIZE",
+				slog.String("value", v),
+				slog.String("err", "parse int or non-positive"))
+		}
+	}
+	var mimeTypes []string
+	if v := envOr("ALLOWED_MIME_TYPES", ""); v != "" {
+		mimeTypes = strings.Split(v, ",")
+	}
+	if maxFileSize > 0 || len(mimeTypes) > 0 {
+		service.Configure(maxFileSize, mimeTypes)
+		slog.Info("service configured from env",
+			slog.Int64("max_file_size", service.MaxUploadBytes))
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	defer stop()
@@ -108,9 +141,17 @@ func run() error {
 	defer depthCh.Close()
 	broker.StartQueueDepthCollector(ctx, depthCh, 15*time.Second)
 
-	repo := storage.NewPostgresAvatarRepo(db)
-	svc := service.New(repo, s3, pub)
+	// Внешние зависимости оборачиваем в circuit breaker'ы (защита от каскадного
+	// отказа при деградации). При превышении лимита ошибок breaker переходит в
+	// Open и возвращает ErrOpenState мгновенно, не трогая реальный ресурс.
+	repo := resilience.NewAvatarRepo(storage.NewPostgresAvatarRepo(db))
+	cbS3 := resilience.NewS3Store(s3)
+	cbPub := resilience.NewPublisher(pub)
+
+	svc := service.New(repo, cbS3, cbPub)
 	ah := httpsrv.NewAvatarHandler(svc)
+	// Для healthz используем сырой s3/amqpCh — проверяется реальная доступность,
+	// не состояние breaker'а.
 	hh := httpsrv.NewHealthHandler(db, s3, amqpCh)
 	srv := httpsrv.New(envOr("HTTP_ADDR", defaultHTTPAddr), ah, hh, logger)
 

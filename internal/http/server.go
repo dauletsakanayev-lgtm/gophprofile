@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
 )
@@ -37,6 +38,11 @@ func New(addr string, ah *AvatarHandler, hh *HealthHandler, logger *slog.Logger)
 	r.Method(http.MethodGet, "/healthz", hh)
 	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
 
+	// OpenAPI/Swagger
+	r.Get("/openapi.yaml", serveOpenAPISpec)
+	r.Get("/swagger", serveSwaggerUI)
+	r.Get("/swagger/", serveSwaggerUI)
+
 	// Статика фронтенда (одностраничка от Yandex Practicum).
 	r.Handle("/", http.RedirectHandler("/web/", http.StatusFound))
 
@@ -64,7 +70,28 @@ func New(addr string, ah *AvatarHandler, hh *HealthHandler, logger *slog.Logger)
 		// Защищённые (с X-User-ID): запись.
 		r.Group(func(r chi.Router) {
 			r.Use(AuthMiddleware)
-			r.Post("/avatars", ah.Create)
+
+			// Rate limit отдельно на POST /avatars — защита от массовых загрузок.
+			// Ключ — X-User-ID (fallback: IP). 10 запросов в минуту.
+			uploadLimiter := httprate.Limit(
+				10, time.Minute,
+				httprate.WithKeyFuncs(
+					func(r *http.Request) (string, error) {
+						if uid := r.Header.Get("X-User-ID"); uid != "" {
+							return "user:" + uid, nil
+						}
+						return httprate.KeyByIP(r)
+					},
+				),
+				httprate.WithLimitHandler(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"Rate limit exceeded","details":"max 10 uploads per minute"}`))
+				}),
+			)
+
+			r.With(uploadLimiter).Post("/avatars", ah.Create)
+
 			r.Delete("/avatars/{id}", ah.Delete)
 			r.Delete("/users/{user_id}/avatar", ah.DeleteUserAvatar)
 		})

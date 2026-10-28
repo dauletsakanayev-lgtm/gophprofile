@@ -7,12 +7,14 @@ require (
 	github.com/XSAM/otelsql v0.44.0
 	github.com/disintegration/imaging v1.6.2
 	github.com/go-chi/chi/v5 v5.3.2
+	github.com/go-chi/httprate v0.16.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/minio/minio-go/v7 v7.3.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rabbitmq/amqp091-go v1.14.0
 	github.com/riandyrn/otelchi v0.12.3
+	github.com/sony/gobreaker v1.0.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.46.0
